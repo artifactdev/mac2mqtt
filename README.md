@@ -10,6 +10,7 @@ It publishes to MQTT:
  * volume mute state
  * battery charge percent
  * **media player information (title, artist, album, app name, state)**
+ * **user activity status (active/inactive with 10-second timeout)**
 
 You can send topics to:
 
@@ -101,6 +102,7 @@ The application supports Home Assistant MQTT autodiscovery. When connected to Ho
 - **Keep Awake Switch** - Toggle to prevent system sleep
 - **System Buttons** - Sleep, shutdown, display sleep/wake, screensaver
 - **Display Brightness Controls** - Individual brightness sliders for each display (requires BetterDisplay CLI)
+- **User Activity Sensor** - Binary sensor showing active/inactive state with 10-second timeout
 
 ### Manual Configuration
 
@@ -234,6 +236,27 @@ The name of the application playing media (e.g., "Spotify", "Apple Music").
 The total duration of the media in seconds.
 
 ### PREFIX + `/status/media_position`
+
+The current position in the media in seconds.
+
+### PREFIX + `/status/user_activity`
+
+The current user activity state: `active` or `inactive`.
+
+This sensor monitors system idle time and provides instant updates when user interaction is detected (mouse movement, keyboard input, etc.). The state changes to `active` immediately upon any user interaction and automatically switches to `inactive` after 10 seconds of no activity.
+
+**Features:**
+- **Instant detection**: No polling delays - activity is detected immediately
+- **Automatic timeout**: Switches to inactive after exactly 10 seconds of inactivity  
+- **System-level monitoring**: Uses macOS IOHIDSystem to track all user input
+- **Event-driven**: Updates are published only when state changes occur
+- **Home Assistant integration**: Appears as an occupancy sensor with device class `occupancy`
+
+This is perfect for automation scenarios like:
+- Turning off lights when user is away from computer
+- Pausing media when user steps away
+- Triggering screensaver or sleep modes
+- Presence detection for home automation
 
 The current position in the media in seconds.
 

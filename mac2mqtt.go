@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -104,6 +105,9 @@ type Application struct {
 	topic             string
 	client            mqtt.Client
 	currentMediaState MediaInfo // persistent media state for streaming
+	userActivityState string    // "active" or "inactive"
+	activityMutex     sync.RWMutex
+	activityTimer     *time.Timer
 }
 
 type config struct {
@@ -193,6 +197,9 @@ func NewApplication() (*Application, error) {
 	} else {
 		app.currentMediaState = MediaInfo{State: "idle"}
 	}
+
+	// Initialize user activity state
+	app.userActivityState = "inactive"
 
 	return app, nil
 }
@@ -907,6 +914,118 @@ func (app *Application) processMediaStreamUpdate(client mqtt.Client, mediaData m
 	log.Printf("Media stream update: %s - %s (%s)", app.currentMediaState.Artist, app.currentMediaState.Title, app.currentMediaState.State)
 }
 
+// getUserActivityState gets the current user activity state
+func (app *Application) getUserActivityState() string {
+	app.activityMutex.RLock()
+	defer app.activityMutex.RUnlock()
+	return app.userActivityState
+}
+
+// setUserActivityState sets the user activity state and publishes to MQTT
+func (app *Application) setUserActivityState(client mqtt.Client, state string) {
+	app.activityMutex.Lock()
+	defer app.activityMutex.Unlock()
+	
+	if app.userActivityState != state {
+		app.userActivityState = state
+		if client != nil && client.IsConnected() {
+			client.Publish(app.getTopicPrefix()+"/status/user_activity", 0, false, state)
+			log.Printf("User activity state changed to: %s", state)
+		}
+	}
+}
+
+// resetActivityTimer resets the inactivity timer
+func (app *Application) resetActivityTimer(client mqtt.Client) {
+	app.activityMutex.Lock()
+	defer app.activityMutex.Unlock()
+	
+	// Set to active immediately
+	if app.userActivityState != "active" {
+		app.userActivityState = "active"
+		if client != nil && client.IsConnected() {
+			client.Publish(app.getTopicPrefix()+"/status/user_activity", 0, false, "active")
+			log.Printf("User activity detected - state: active")
+		}
+	}
+	
+	// Reset or create the timer
+	if app.activityTimer != nil {
+		app.activityTimer.Stop()
+	}
+	
+	app.activityTimer = time.AfterFunc(10*time.Second, func() {
+		app.setUserActivityState(client, "inactive")
+	})
+}
+
+// getSystemIdleTime gets the system idle time in seconds
+func getSystemIdleTime() (int, error) {
+	cmd := exec.Command("ioreg", "-c", "IOHIDSystem")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("error running ioreg: %w", err)
+	}
+	
+	// Parse the HIDIdleTime from the output
+	re := regexp.MustCompile(`"HIDIdleTime" = (\d+)`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) < 2 {
+		return 0, fmt.Errorf("HIDIdleTime not found in ioreg output")
+	}
+	
+	idleTimeNanos, err := strconv.ParseInt(matches[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("error parsing idle time: %w", err)
+	}
+	
+	// Convert nanoseconds to seconds
+	idleTimeSeconds := int(idleTimeNanos / 1000000000)
+	return idleTimeSeconds, nil
+}
+
+// startUserActivityMonitoring starts monitoring user activity using system idle time
+func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
+	log.Println("Starting user activity monitoring...")
+	
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Activity monitor goroutine recovered from panic: %v", r)
+			}
+		}()
+		
+		var lastIdleTime int = -1
+		
+		for {
+			// Check if client is still connected
+			if client == nil || !client.IsConnected() {
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			
+			idleTime, err := getSystemIdleTime()
+			if err != nil {
+				log.Printf("Error getting system idle time: %v", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			
+			// If idle time decreased or is very small, user is active
+			if idleTime < lastIdleTime || idleTime < 2 {
+				app.resetActivityTimer(client)
+			}
+			
+			lastIdleTime = idleTime
+			
+			// Check every 500ms for responsive detection
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+	
+	log.Println("User activity monitoring started successfully")
+}
+
 // publishMediaState publishes the current media state to MQTT
 func (app *Application) publishMediaState(client mqtt.Client, state, title, artist, album, appName string, duration, position int) {
 	// Publish individual attributes
@@ -994,12 +1113,16 @@ func (app *Application) connectHandler(client mqtt.Client) {
 		go app.startMediaStream(client)
 	}
 
+	// Start user activity monitoring
+	go app.startUserActivityMonitoring(client)
+
 	// Send initial state updates
 	app.updateVolume(client)
 	app.updateMute(client)
 	app.updateCaffeinateStatus(client)
 	app.updateDisplayBrightness(client)
 	app.updateNowPlaying(client)
+	app.setUserActivityState(client, "inactive") // Initial state
 }
 
 func (app *Application) connectLostHandler(client mqtt.Client, err error) {
@@ -1436,6 +1559,19 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"keepawake":    keepawake,
 	}
 
+	// Add user activity sensor
+	userActivity := map[string]interface{}{
+		"p":           "binary_sensor",
+		"name":        "User Activity",
+		"unique_id":   app.hostname + "_user_activity",
+		"state_topic": app.getTopicPrefix() + "/status/user_activity",
+		"payload_on":  "active",
+		"payload_off": "inactive",
+		"icon":        "mdi:account-check",
+		"device_class": "occupancy",
+	}
+	components["user_activity"] = userActivity
+
 	// Add media control components if Media Control is available
 	if isMediaControlAvailable() {
 		playPause := map[string]interface{}{
@@ -1582,9 +1718,13 @@ func (app *Application) Run() error {
 		app.updateCaffeinateStatus(app.client)
 		app.updateDisplayBrightness(app.client)
 		app.updateNowPlaying(app.client) // Initial now playing update
+		app.setUserActivityState(app.client, "inactive") // Initial user activity state
 
 		// Start media stream for real-time updates
 		app.startMediaStream(app.client)
+		
+		// Start user activity monitoring
+		app.startUserActivityMonitoring(app.client)
 	} else {
 		log.Println("Skipping initial MQTT setup - will configure when connection is established")
 	}
