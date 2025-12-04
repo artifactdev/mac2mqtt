@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shirou/gopsutil/v3/mem" // Using v3 for current versions
 	"gopkg.in/yaml.v2"
 
 	sigar "github.com/cloudfoundry/gosigar"
@@ -1043,7 +1044,7 @@ func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 			}
 
 			lastIdleTime = idleTime
-
+			client.Publish(app.getTopicPrefix()+"/status/idle_time_seconds", 0, false, fmt.Sprintf("%d", idleTime))
 			// Check every 500ms for responsive detection
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -1585,25 +1586,21 @@ func (app *Application) getCPUUsage() (*CPUUsage, error) {
 }
 
 func getMemoryUsage() (*MemoryUsage, error) {
-	mem := sigar.Mem{}
-	if err := mem.Get(); err != nil {
-		return nil, fmt.Errorf("failed to get memory stats: %w", err)
+	vmStat, err := mem.VirtualMemory()
+	if err != nil {
+		log.Fatalf("Error getting virtual memory stats: %v", err)
 	}
 
-	// Calculate percentages
-	usedPercent := float64(0)
-	freePercent := float64(0)
-	if mem.Total > 0 {
-		usedPercent = float64(mem.Used) / float64(mem.Total) * 100
-		freePercent = float64(mem.Free) / float64(mem.Total) * 100
-	}
+	total := vmStat.Total
+	used := vmStat.Used
+	free := vmStat.Free
 
 	return &MemoryUsage{
-		Total:       mem.Total,
-		Used:        mem.Used,
-		Free:        mem.Free,
-		UsedPercent: usedPercent,
-		FreePercent: freePercent,
+		Total:       total,
+		Used:        used,
+		Free:        free,
+		UsedPercent: vmStat.UsedPercent,
+		FreePercent: 100 - vmStat.UsedPercent,
 	}, nil
 }
 
@@ -2084,6 +2081,19 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"device_class": "occupancy",
 	}
 	components["user_activity"] = userActivity
+
+	// Add idle time sensor
+	idleTime := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                app.hostname + " User Idle Time",
+		"unique_id":           app.hostname + "_idle_time_seconds",
+		"state_topic":         app.getTopicPrefix() + "/status/idle_time_seconds",
+		"unit_of_measurement": "s",
+		"device_class":        "duration",
+		"state_class":         "measurement",
+		"icon":                "mdi:timer-sand",
+	}
+	components["idle_time_seconds"] = idleTime
 
 	// Add media control components if Media Control is available
 	if isMediaControlAvailable() {
