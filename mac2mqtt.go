@@ -154,6 +154,11 @@ func (c *config) getConfig() *config {
 		log.Fatal("Must specify mqtt_ip in mac2mqtt.yaml")
 	}
 
+	if c.IdleActivityTime == 0 {
+		log.Println("No idle_activity_time specified in config, using default 10 seconds")
+
+	}
+
 	if c.Port == "" {
 		log.Fatal("Must specify mqtt_port in mac2mqtt.yaml")
 	}
@@ -975,7 +980,7 @@ func (app *Application) resetActivityTimer(client mqtt.Client) {
 		app.activityTimer.Stop()
 	}
 
-	app.activityTimer = time.AfterFunc(10*time.Second, func() {
+	app.activityTimer = time.AfterFunc(time.Duration(app.config.IdleActivityTime)*time.Second, func() {
 		app.setUserActivityState(client, "inactive")
 	})
 }
