@@ -19,7 +19,11 @@ import (
 
 	"gopkg.in/yaml.v2"
 
+	sigar "github.com/cloudfoundry/gosigar"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+
+	// Using my fork until #9 is resolved ( https://github.com/antonfisher/go-media-devices-state/pull/9 )
+	mediadevices "github.com/antonfisher/go-media-devices-state"
 )
 
 func init() {
@@ -108,6 +112,8 @@ type Application struct {
 	userActivityState string    // "active" or "inactive"
 	activityMutex     sync.RWMutex
 	activityTimer     *time.Timer
+	lastCPU           sigar.Cpu // for CPU percentage calculation
+	cpuMutex          sync.RWMutex
 }
 
 type config struct {
@@ -129,6 +135,7 @@ func (c *config) getConfig() *config {
 	}
 	exPath := filepath.Dir(ex)
 
+	log.Printf("Path: %v", exPath)
 	configContent, err := os.ReadFile(exPath + "/mac2mqtt.yaml")
 	if err != nil {
 		log.Fatal("No config file provided")
@@ -200,6 +207,11 @@ func NewApplication() (*Application, error) {
 
 	// Initialize user activity state
 	app.userActivityState = "inactive"
+
+	// Initialize CPU stats for percentage calculation
+	if err := app.lastCPU.Get(); err != nil {
+		log.Printf("Warning: Failed to initialize CPU stats: %v", err)
+	}
 
 	return app, nil
 }
@@ -539,7 +551,7 @@ func isDisplayAvailable(displayID string) bool {
 	if displays == nil {
 		return false
 	}
-	
+
 	for _, display := range displays {
 		if display.DisplayID == displayID {
 			return true
@@ -925,7 +937,7 @@ func (app *Application) getUserActivityState() string {
 func (app *Application) setUserActivityState(client mqtt.Client, state string) {
 	app.activityMutex.Lock()
 	defer app.activityMutex.Unlock()
-	
+
 	if app.userActivityState != state {
 		app.userActivityState = state
 		if client != nil && client.IsConnected() {
@@ -939,7 +951,7 @@ func (app *Application) setUserActivityState(client mqtt.Client, state string) {
 func (app *Application) resetActivityTimer(client mqtt.Client) {
 	app.activityMutex.Lock()
 	defer app.activityMutex.Unlock()
-	
+
 	// Set to active immediately
 	if app.userActivityState != "active" {
 		app.userActivityState = "active"
@@ -948,12 +960,12 @@ func (app *Application) resetActivityTimer(client mqtt.Client) {
 			log.Printf("User activity detected - state: active")
 		}
 	}
-	
+
 	// Reset or create the timer
 	if app.activityTimer != nil {
 		app.activityTimer.Stop()
 	}
-	
+
 	app.activityTimer = time.AfterFunc(10*time.Second, func() {
 		app.setUserActivityState(client, "inactive")
 	})
@@ -966,19 +978,19 @@ func getSystemIdleTime() (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("error running ioreg: %w", err)
 	}
-	
+
 	// Parse the HIDIdleTime from the output
 	re := regexp.MustCompile(`"HIDIdleTime" = (\d+)`)
 	matches := re.FindStringSubmatch(string(output))
 	if len(matches) < 2 {
 		return 0, fmt.Errorf("HIDIdleTime not found in ioreg output")
 	}
-	
+
 	idleTimeNanos, err := strconv.ParseInt(matches[1], 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("error parsing idle time: %w", err)
 	}
-	
+
 	// Convert nanoseconds to seconds
 	idleTimeSeconds := int(idleTimeNanos / 1000000000)
 	return idleTimeSeconds, nil
@@ -987,42 +999,42 @@ func getSystemIdleTime() (int, error) {
 // startUserActivityMonitoring starts monitoring user activity using system idle time
 func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 	log.Println("Starting user activity monitoring...")
-	
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("Activity monitor goroutine recovered from panic: %v", r)
 			}
 		}()
-		
+
 		var lastIdleTime int = -1
-		
+
 		for {
 			// Check if client is still connected
 			if client == nil || !client.IsConnected() {
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			
+
 			idleTime, err := getSystemIdleTime()
 			if err != nil {
 				log.Printf("Error getting system idle time: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
 			}
-			
+
 			// If idle time decreased or is very small, user is active
 			if idleTime < lastIdleTime || idleTime < 2 {
 				app.resetActivityTimer(client)
 			}
-			
+
 			lastIdleTime = idleTime
-			
+
 			// Check every 500ms for responsive detection
 			time.Sleep(500 * time.Millisecond)
 		}
 	}()
-	
+
 	log.Println("User activity monitoring started successfully")
 }
 
@@ -1127,7 +1139,7 @@ func (app *Application) connectHandler(client mqtt.Client) {
 
 func (app *Application) connectLostHandler(client mqtt.Client, err error) {
 	log.Printf("Disconnected from MQTT: %v", err)
-	
+
 	// Check if it's a network issue
 	if !app.isNetworkReachable() {
 		log.Println("MQTT broker is not reachable - likely on a different network")
@@ -1195,17 +1207,17 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 
 	// Network-aware connection reliability settings
 	opts.SetClientID(app.hostname + "_mac2mqtt")
-	opts.SetKeepAlive(60 * time.Second)   // Send ping every 60 seconds
-	opts.SetPingTimeout(10 * time.Second) // Shorter ping timeout for faster network change detection
+	opts.SetKeepAlive(60 * time.Second)      // Send ping every 60 seconds
+	opts.SetPingTimeout(10 * time.Second)    // Shorter ping timeout for faster network change detection
 	opts.SetConnectTimeout(15 * time.Second) // Shorter connect timeout for network switching
-	opts.SetAutoReconnect(true)           // Enable auto-reconnect
+	opts.SetAutoReconnect(true)              // Enable auto-reconnect
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(15 * time.Second) // Wait 15 seconds between retries (good for network switches)
-	opts.SetMaxReconnectInterval(2 * time.Minute) // Max 2 minutes between reconnect attempts (faster recovery)
-	opts.SetCleanSession(false)           // Resume session to avoid losing subscriptions
-	opts.SetOrderMatters(false)           // Allow out-of-order delivery for better performance
-	opts.SetWriteTimeout(10 * time.Second) // Shorter write timeout for network issues
-	opts.SetResumeSubs(true)              // Resume subscriptions on reconnect
+	opts.SetMaxReconnectInterval(2 * time.Minute)  // Max 2 minutes between reconnect attempts (faster recovery)
+	opts.SetCleanSession(false)                    // Resume session to avoid losing subscriptions
+	opts.SetOrderMatters(false)                    // Allow out-of-order delivery for better performance
+	opts.SetWriteTimeout(10 * time.Second)         // Shorter write timeout for network issues
+	opts.SetResumeSubs(true)                       // Resume subscriptions on reconnect
 
 	// Set will message
 	opts.SetWill(app.getTopicPrefix()+"/status/alive", "offline", 0, true)
@@ -1445,6 +1457,167 @@ func getBatteryChargePercent() string {
 	return res[1]
 }
 
+// DiskUsage holds disk usage statistics
+type DiskUsage struct {
+	Total       uint64  `json:"total"`        // Total bytes
+	Used        uint64  `json:"used"`         // Used bytes
+	Free        uint64  `json:"free"`         // Free bytes
+	UsedPercent float64 `json:"used_percent"` // Used percentage
+	FreePercent float64 `json:"free_percent"` // Free percentage
+}
+
+func getDiskUsage() (*DiskUsage, error) {
+	fs := sigar.FileSystemList{}
+	if err := fs.Get(); err != nil {
+		return nil, fmt.Errorf("failed to get filesystem list: %w", err)
+	}
+
+	// Find the root filesystem
+	for _, filesystem := range fs.List {
+		if filesystem.DirName == "/" {
+			usage := sigar.FileSystemUsage{}
+			if err := usage.Get(filesystem.DirName); err != nil {
+				return nil, fmt.Errorf("failed to get disk usage: %w", err)
+			}
+
+			// Convert from KB to bytes (gosigar returns values in KB)
+			totalBytes := usage.Total * 1024
+			usedBytes := usage.Used * 1024
+			freeBytes := usage.Free * 1024
+
+			// Calculate percentages
+			usedPercent := float64(0)
+			freePercent := float64(0)
+			if totalBytes > 0 {
+				usedPercent = float64(usedBytes) / float64(totalBytes) * 100
+				freePercent = float64(freeBytes) / float64(totalBytes) * 100
+			}
+
+			return &DiskUsage{
+				Total:       totalBytes,
+				Used:        usedBytes,
+				Free:        freeBytes,
+				UsedPercent: usedPercent,
+				FreePercent: freePercent,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("root filesystem not found")
+}
+
+// CPUUsage holds CPU usage statistics
+type CPUUsage struct {
+	UsedPercent float64 `json:"used_percent"` // CPU used percentage
+	FreePercent float64 `json:"free_percent"` // CPU idle/free percentage
+}
+
+// MemoryUsage holds memory usage statistics
+type MemoryUsage struct {
+	Total       uint64  `json:"total"`        // Total bytes
+	Used        uint64  `json:"used"`         // Used bytes
+	Free        uint64  `json:"free"`         // Free bytes
+	UsedPercent float64 `json:"used_percent"` // Used percentage
+	FreePercent float64 `json:"free_percent"` // Free percentage
+}
+
+// UptimeInfo holds system uptime information
+type UptimeInfo struct {
+	Seconds uint64 `json:"seconds"` // Uptime in seconds
+	Human   string `json:"human"`   // Human-readable format
+}
+
+func (app *Application) getCPUUsage() (*CPUUsage, error) {
+	cpu := sigar.Cpu{}
+	if err := cpu.Get(); err != nil {
+		return nil, fmt.Errorf("failed to get CPU stats: %w", err)
+	}
+
+	app.cpuMutex.Lock()
+	defer app.cpuMutex.Unlock()
+
+	// Calculate the delta since last measurement
+	userDelta := cpu.User - app.lastCPU.User
+	sysDelta := cpu.Sys - app.lastCPU.Sys
+	idleDelta := cpu.Idle - app.lastCPU.Idle
+	waitDelta := cpu.Wait - app.lastCPU.Wait
+	niceDelta := cpu.Nice - app.lastCPU.Nice
+	irqDelta := cpu.Irq - app.lastCPU.Irq
+	softIrqDelta := cpu.SoftIrq - app.lastCPU.SoftIrq
+	stolenDelta := cpu.Stolen - app.lastCPU.Stolen
+
+	// Calculate total time delta
+	totalDelta := userDelta + sysDelta + idleDelta + waitDelta + niceDelta + irqDelta + softIrqDelta + stolenDelta
+
+	// Store current CPU stats for next calculation
+	app.lastCPU = cpu
+
+	// If this is the first measurement or total is zero, return 0% usage
+	if totalDelta == 0 {
+		return &CPUUsage{
+			UsedPercent: 0,
+			FreePercent: 100,
+		}, nil
+	}
+
+	// Calculate idle and used percentages
+	idlePercent := float64(idleDelta) / float64(totalDelta) * 100
+	usedPercent := 100 - idlePercent
+
+	return &CPUUsage{
+		UsedPercent: usedPercent,
+		FreePercent: idlePercent,
+	}, nil
+}
+
+func getMemoryUsage() (*MemoryUsage, error) {
+	mem := sigar.Mem{}
+	if err := mem.Get(); err != nil {
+		return nil, fmt.Errorf("failed to get memory stats: %w", err)
+	}
+
+	// Calculate percentages
+	usedPercent := float64(0)
+	freePercent := float64(0)
+	if mem.Total > 0 {
+		usedPercent = float64(mem.Used) / float64(mem.Total) * 100
+		freePercent = float64(mem.Free) / float64(mem.Total) * 100
+	}
+
+	return &MemoryUsage{
+		Total:       mem.Total,
+		Used:        mem.Used,
+		Free:        mem.Free,
+		UsedPercent: usedPercent,
+		FreePercent: freePercent,
+	}, nil
+}
+
+func getSystemUptime() (*UptimeInfo, error) {
+	uptime := sigar.Uptime{}
+	if err := uptime.Get(); err != nil {
+		return nil, fmt.Errorf("failed to get uptime: %w", err)
+	}
+
+	// Convert to human-readable format
+	totalSeconds := uint64(uptime.Length)
+	days := totalSeconds / 86400
+	hours := (totalSeconds % 86400) / 3600
+	minutes := (totalSeconds % 3600) / 60
+
+	var uptimeHuman string
+	if days > 0 {
+		uptimeHuman = fmt.Sprintf("%d days, %d:%02d", days, hours, minutes)
+	} else {
+		uptimeHuman = fmt.Sprintf("%d:%02d", hours, minutes)
+	}
+
+	return &UptimeInfo{
+		Seconds: totalSeconds,
+		Human:   uptimeHuman,
+	}, nil
+}
+
 func (app *Application) updateBattery(client mqtt.Client) {
 	token := client.Publish(app.getTopicPrefix()+"/status/battery", 0, false, getBatteryChargePercent())
 	token.Wait()
@@ -1453,6 +1626,132 @@ func (app *Application) updateBattery(client mqtt.Client) {
 func (app *Application) updateCaffeinateStatus(client mqtt.Client) {
 	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(getCaffeinateStatus()))
 	token.Wait()
+}
+
+func (app *Application) updateDiskUsage(client mqtt.Client) {
+	diskUsage, err := getDiskUsage()
+	if err != nil {
+		log.Printf("Failed to get disk usage: %v", err)
+		return
+	}
+
+	// Publish individual metrics
+	client.Publish(app.getTopicPrefix()+"/status/disk/total", 0, false, fmt.Sprintf("%d", diskUsage.Total))
+	client.Publish(app.getTopicPrefix()+"/status/disk/used", 0, false, fmt.Sprintf("%d", diskUsage.Used))
+	client.Publish(app.getTopicPrefix()+"/status/disk/free", 0, false, fmt.Sprintf("%d", diskUsage.Free))
+	client.Publish(app.getTopicPrefix()+"/status/disk/used_percent", 0, false, fmt.Sprintf("%.2f", diskUsage.UsedPercent))
+	client.Publish(app.getTopicPrefix()+"/status/disk/free_percent", 0, false, fmt.Sprintf("%.2f", diskUsage.FreePercent))
+}
+
+func (app *Application) updateCPUUsage(client mqtt.Client) {
+	cpuUsage, err := app.getCPUUsage()
+	if err != nil {
+		log.Printf("Failed to get CPU usage: %v", err)
+		return
+	}
+
+	// Publish CPU metrics
+	client.Publish(app.getTopicPrefix()+"/status/cpu/used_percent", 0, false, fmt.Sprintf("%.2f", cpuUsage.UsedPercent))
+	client.Publish(app.getTopicPrefix()+"/status/cpu/free_percent", 0, false, fmt.Sprintf("%.2f", cpuUsage.FreePercent))
+}
+
+func (app *Application) updateMemoryUsage(client mqtt.Client) {
+	memUsage, err := getMemoryUsage()
+	if err != nil {
+		log.Printf("Failed to get memory usage: %v", err)
+		return
+	}
+
+	// Publish memory metrics
+	client.Publish(app.getTopicPrefix()+"/status/memory/total", 0, false, fmt.Sprintf("%d", memUsage.Total))
+	client.Publish(app.getTopicPrefix()+"/status/memory/used", 0, false, fmt.Sprintf("%d", memUsage.Used))
+	client.Publish(app.getTopicPrefix()+"/status/memory/free", 0, false, fmt.Sprintf("%d", memUsage.Free))
+	client.Publish(app.getTopicPrefix()+"/status/memory/used_percent", 0, false, fmt.Sprintf("%.2f", memUsage.UsedPercent))
+	client.Publish(app.getTopicPrefix()+"/status/memory/free_percent", 0, false, fmt.Sprintf("%.2f", memUsage.FreePercent))
+}
+
+func (app *Application) updateUptime(client mqtt.Client) {
+	uptime, err := getSystemUptime()
+	if err != nil {
+		log.Printf("Failed to get uptime: %v", err)
+		return
+	}
+
+	// Publish uptime metrics
+	client.Publish(app.getTopicPrefix()+"/status/uptime/seconds", 0, false, fmt.Sprintf("%d", uptime.Seconds))
+	client.Publish(app.getTopicPrefix()+"/status/uptime/human", 0, false, uptime.Human)
+}
+
+func getMediaDevicesState() (bool, bool, error) {
+	isMicOn, err := mediadevices.IsMicrophoneOn()
+	if err != nil {
+		return false, false, fmt.Errorf("failed to get microphone state: %w", err)
+	}
+
+	isCameraOn, err := mediadevices.IsCameraOn()
+	if err != nil {
+		return isMicOn, false, fmt.Errorf("failed to get camera state: %w", err)
+	}
+
+	return isMicOn, isCameraOn, nil
+}
+
+func (app *Application) updateMediaDevices(client mqtt.Client) {
+	isMicOn, isCameraOn, err := getMediaDevicesState()
+	if err != nil {
+		log.Printf("Failed to get media devices state: %v", err)
+		// Publish "unknown" state on error
+		client.Publish(app.getTopicPrefix()+"/status/microphone", 0, false, "OFF")
+		client.Publish(app.getTopicPrefix()+"/status/camera", 0, false, "OFF")
+		return
+	}
+
+	// Publish media device states
+	micState := "OFF"
+	if isMicOn {
+		micState = "ON"
+	}
+	cameraState := "OFF"
+	if isCameraOn {
+		cameraState = "ON"
+	}
+
+	client.Publish(app.getTopicPrefix()+"/status/microphone", 0, false, micState)
+	client.Publish(app.getTopicPrefix()+"/status/camera", 0, false, cameraState)
+}
+
+func getPublicIP() (string, error) {
+
+	resolver := "1.1.1.1:53" // Cloudflare's DNS resolver
+	hostname := "whoami.cloudflare"
+
+	// Look up TXT records
+	txtRecords, err := net.LookupTXT(hostname + "." + resolver) // Note: This uses the default resolver
+	if err != nil {
+		log.Printf("Error looking up TXT records: %v\n", err)
+		return "", err
+	}
+
+	// Print the first record if found
+	if len(txtRecords) > 0 {
+		return txtRecords[0], nil
+	}
+
+	return "No TXT records found.", nil
+
+}
+
+func (app *Application) updatePublicIP(client mqtt.Client) {
+	publicIP, err := getPublicIP()
+	if err != nil {
+		log.Printf("Failed to get public IP: %v", err)
+		// Publish empty string on error
+		client.Publish(app.getTopicPrefix()+"/status/public_ip", 0, false, "unavailable")
+		return
+	}
+
+	// Publish public IP
+	client.Publish(app.getTopicPrefix()+"/status/public_ip", 0, false, publicIP)
 }
 
 func (app *Application) setDevice(client mqtt.Client) {
@@ -1547,27 +1846,219 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"device_class":        "battery",
 	}
 
+	diskTotal := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Disk Total",
+		"unique_id":           app.hostname + "_disk_total",
+		"state_topic":         app.getTopicPrefix() + "/status/disk/total",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:harddisk",
+	}
+
+	diskUsed := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Disk Used",
+		"unique_id":           app.hostname + "_disk_used",
+		"state_topic":         app.getTopicPrefix() + "/status/disk/used",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:harddisk",
+	}
+
+	diskFree := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Disk Free",
+		"unique_id":           app.hostname + "_disk_free",
+		"state_topic":         app.getTopicPrefix() + "/status/disk/free",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:harddisk",
+	}
+
+	diskUsedPercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Disk Used Percent",
+		"unique_id":           app.hostname + "_disk_used_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/disk/used_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:chart-pie",
+	}
+
+	diskFreePercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Disk Free Percent",
+		"unique_id":           app.hostname + "_disk_free_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/disk/free_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:chart-pie",
+	}
+
+	cpuUsedPercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "CPU Used Percent",
+		"unique_id":           app.hostname + "_cpu_used_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/cpu/used_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:cpu-64-bit",
+	}
+
+	cpuFreePercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "CPU Free Percent",
+		"unique_id":           app.hostname + "_cpu_free_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/cpu/free_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:cpu-64-bit",
+	}
+
+	memoryTotal := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Memory Total",
+		"unique_id":           app.hostname + "_memory_total",
+		"state_topic":         app.getTopicPrefix() + "/status/memory/total",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:memory",
+	}
+
+	memoryUsed := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Memory Used",
+		"unique_id":           app.hostname + "_memory_used",
+		"state_topic":         app.getTopicPrefix() + "/status/memory/used",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:memory",
+	}
+
+	memoryFree := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Memory Free",
+		"unique_id":           app.hostname + "_memory_free",
+		"state_topic":         app.getTopicPrefix() + "/status/memory/free",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "measurement",
+		"icon":                "mdi:memory",
+	}
+
+	memoryUsedPercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Memory Used Percent",
+		"unique_id":           app.hostname + "_memory_used_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/memory/used_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:memory",
+	}
+
+	memoryFreePercent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Memory Free Percent",
+		"unique_id":           app.hostname + "_memory_free_percent",
+		"state_topic":         app.getTopicPrefix() + "/status/memory/free_percent",
+		"unit_of_measurement": "%",
+		"state_class":         "measurement",
+		"icon":                "mdi:memory",
+	}
+
+	uptimeSeconds := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Uptime Seconds",
+		"unique_id":           app.hostname + "_uptime_seconds",
+		"state_topic":         app.getTopicPrefix() + "/status/uptime/seconds",
+		"unit_of_measurement": "s",
+		"device_class":        "duration",
+		"state_class":         "total_increasing",
+		"icon":                "mdi:clock-outline",
+	}
+
+	uptimeHuman := map[string]interface{}{
+		"p":           "sensor",
+		"name":        "Uptime",
+		"unique_id":   app.hostname + "_uptime_human",
+		"state_topic": app.getTopicPrefix() + "/status/uptime/human",
+		"icon":        "mdi:clock-outline",
+	}
+
+	microphone := map[string]interface{}{
+		"p":            "binary_sensor",
+		"name":         "Microphone",
+		"unique_id":    app.hostname + "_microphone",
+		"state_topic":  app.getTopicPrefix() + "/status/microphone",
+		"payload_on":   "ON",
+		"payload_off":  "OFF",
+		"icon":         "mdi:microphone",
+		"device_class": "running",
+	}
+
+	camera := map[string]interface{}{
+		"p":            "binary_sensor",
+		"name":         "Camera",
+		"unique_id":    app.hostname + "_camera",
+		"state_topic":  app.getTopicPrefix() + "/status/camera",
+		"payload_on":   "ON",
+		"payload_off":  "OFF",
+		"icon":         "mdi:camera",
+		"device_class": "running",
+	}
+
+	publicIP := map[string]interface{}{
+		"p":           "sensor",
+		"name":        "Public IP",
+		"unique_id":   app.hostname + "_public_ip",
+		"state_topic": app.getTopicPrefix() + "/status/public_ip",
+		"icon":        "mdi:ip-network",
+	}
+
 	components := map[string]interface{}{
-		"sleep":        sleep,
-		"shutdown":     shutdown,
-		"volume":       volume,
-		"mute":         mute,
-		"displaywake":  displaywake,
-		"displaysleep": displaysleep,
-		"screensaver":  screensaver,
-		"battery":      battery,
-		"keepawake":    keepawake,
+		"sleep":               sleep,
+		"shutdown":            shutdown,
+		"volume":              volume,
+		"mute":                mute,
+		"displaywake":         displaywake,
+		"displaysleep":        displaysleep,
+		"screensaver":         screensaver,
+		"battery":             battery,
+		"keepawake":           keepawake,
+		"disk_total":          diskTotal,
+		"disk_used":           diskUsed,
+		"disk_free":           diskFree,
+		"disk_used_percent":   diskUsedPercent,
+		"disk_free_percent":   diskFreePercent,
+		"cpu_used_percent":    cpuUsedPercent,
+		"cpu_free_percent":    cpuFreePercent,
+		"memory_total":        memoryTotal,
+		"memory_used":         memoryUsed,
+		"memory_free":         memoryFree,
+		"memory_used_percent": memoryUsedPercent,
+		"memory_free_percent": memoryFreePercent,
+		"uptime_seconds":      uptimeSeconds,
+		"uptime_human":        uptimeHuman,
+		"microphone":          microphone,
+		"camera":              camera,
+		"public_ip":           publicIP,
 	}
 
 	// Add user activity sensor
 	userActivity := map[string]interface{}{
-		"p":           "binary_sensor",
-		"name":        "User Activity",
-		"unique_id":   app.hostname + "_user_activity",
-		"state_topic": app.getTopicPrefix() + "/status/user_activity",
-		"payload_on":  "active",
-		"payload_off": "inactive",
-		"icon":        "mdi:account-check",
+		"p":            "binary_sensor",
+		"name":         "User Activity",
+		"unique_id":    app.hostname + "_user_activity",
+		"state_topic":  app.getTopicPrefix() + "/status/user_activity",
+		"payload_on":   "active",
+		"payload_off":  "inactive",
+		"icon":         "mdi:account-check",
 		"device_class": "occupancy",
 	}
 	components["user_activity"] = userActivity
@@ -1645,7 +2136,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 func (app *Application) handleOfflineMode() {
 	log.Println("Operating in offline mode - MQTT broker not reachable")
 	log.Println("Application will continue monitoring system state and attempt to reconnect periodically")
-	
+
 	// Continue basic system monitoring even when offline
 	// This ensures the application doesn't crash and can recover when network returns
 }
@@ -1717,12 +2208,18 @@ func (app *Application) Run() error {
 		app.updateMute(app.client)
 		app.updateCaffeinateStatus(app.client)
 		app.updateDisplayBrightness(app.client)
-		app.updateNowPlaying(app.client) // Initial now playing update
+		app.updateNowPlaying(app.client)                 // Initial now playing update
 		app.setUserActivityState(app.client, "inactive") // Initial user activity state
+		app.updateDiskUsage(app.client)                  // Initial disk usage update
+		app.updateCPUUsage(app.client)                   // Initial CPU usage update
+		app.updateMemoryUsage(app.client)                // Initial memory usage update
+		app.updateUptime(app.client)                     // Initial uptime update
+		app.updateMediaDevices(app.client)               // Initial media devices update
+		app.updatePublicIP(app.client)                   // Initial public IP update
 
 		// Start media stream for real-time updates
 		app.startMediaStream(app.client)
-		
+
 		// Start user activity monitoring
 		app.startUserActivityMonitoring(app.client)
 	} else {
@@ -1737,6 +2234,7 @@ func (app *Application) Run() error {
 			if app.client.IsConnected() {
 				app.updateVolume(app.client)
 				app.updateMute(app.client)
+				app.updateMediaDevices(app.client)
 				app.client.Publish(app.getTopicPrefix()+"/status/alive", 0, true, "online")
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, connection may be recovering")
@@ -1745,6 +2243,11 @@ func (app *Application) Run() error {
 		case <-batteryTicker.C:
 			if app.client.IsConnected() {
 				app.updateBattery(app.client)
+				app.updateDiskUsage(app.client)
+				app.updateCPUUsage(app.client)
+				app.updateMemoryUsage(app.client)
+				app.updateUptime(app.client)
+				app.updatePublicIP(app.client)
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping battery update")
 			}
@@ -1762,7 +2265,7 @@ func (app *Application) Run() error {
 			// Periodic network reachability check
 			currentNetworkState := app.isNetworkReachable()
 			currentConnectionState := app.client.IsConnected()
-			
+
 			// Log network state changes
 			if currentNetworkState != networkReachable {
 				if currentNetworkState {
@@ -1772,7 +2275,7 @@ func (app *Application) Run() error {
 				}
 				networkReachable = currentNetworkState
 			}
-			
+
 			// Log connection state changes
 			if currentConnectionState != lastConnectionState {
 				if currentConnectionState {
@@ -1782,7 +2285,7 @@ func (app *Application) Run() error {
 				}
 				lastConnectionState = currentConnectionState
 			}
-			
+
 			// Handle network state changes
 			if currentNetworkState && !networkReachable {
 				// Network just became reachable - try to reconnect if not already connected
