@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -178,11 +179,12 @@ func NewApplication() (*Application, error) {
 		app.hostname = app.config.Hostname
 	}
 
-	// Set topic
+	// Set topic - append hostname to allow multiple instances
 	if app.config.Topic == "" {
 		app.topic = DefaultTopicPrefix + "/" + app.hostname
 	} else {
-		app.topic = app.config.Topic
+		// Append hostname to the configured topic
+		app.topic = app.config.Topic + "/" + app.hostname
 	}
 
 	// Validate configuration
@@ -507,6 +509,7 @@ func commandPlayPause() {
 
 // getDisplays retrieves all available displays using BetterDisplay CLI
 func getDisplays() []Display {
+
 	// Check if BetterDisplay CLI is available
 	if !isBetterDisplayCLIAvailable() {
 		log.Println("BetterDisplay CLI is not installed or not accessible")
@@ -1721,24 +1724,32 @@ func (app *Application) updateMediaDevices(client mqtt.Client) {
 }
 
 func getPublicIP() (string, error) {
+	// Use DNS over HTTPS to query Cloudflare's whoami service
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: 5 * time.Second,
+			}
+			return d.DialContext(ctx, "udp", "ns1.google.com:53")
 
-	resolver := "1.1.1.1:53" // Cloudflare's DNS resolver
-	hostname := "whoami.cloudflare"
-
-	// Look up TXT records
-	txtRecords, err := net.LookupTXT(hostname + "." + resolver) // Note: This uses the default resolver
-	if err != nil {
-		log.Printf("Error looking up TXT records: %v\n", err)
-		return "", err
+		},
 	}
 
-	// Print the first record if found
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Query TXT record from Cloudflare's whoami service
+	txtRecords, err := resolver.LookupTXT(ctx, "o-o.myaddr.l.google.com")
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup public IP via DNS: %w", err)
+	}
+
 	if len(txtRecords) > 0 {
 		return txtRecords[0], nil
 	}
 
-	return "No TXT records found.", nil
-
+	return "", fmt.Errorf("no IP address found in DNS response")
 }
 
 func (app *Application) updatePublicIP(client mqtt.Client) {
