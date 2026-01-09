@@ -20,6 +20,8 @@ type Config struct {
 	Topic            string `yaml:"mqtt_topic"`
 	DiscoveryPrefix  string `yaml:"discovery_prefix"`
 	IdleActivityTime int    `yaml:"idle_activity_time"` // in seconds
+	LMStudioEnabled  bool   `yaml:"lmstudio_enabled"`   // Enable LM Studio integration
+	LMStudioAPIURL   string `yaml:"lmstudio_api_url"`   // LM Studio API URL (default: http://localhost:1234)
 }
 
 // LoadConfig loads the configuration from mac2mqtt.yaml in the executable directory
@@ -49,6 +51,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.DiscoveryPrefix == "" {
 		c.DiscoveryPrefix = "homeassistant"
+	}
+	if c.LMStudioAPIURL == "" {
+		c.LMStudioAPIURL = "http://localhost:1234"
 	}
 
 	// Validate required fields

@@ -75,6 +75,9 @@ type Application struct {
 	activityTimer     *time.Timer
 	lastCPU           sigar.Cpu // for CPU percentage calculation
 	cpuMutex          sync.RWMutex
+	lmstudioServerRunning bool                 // LM Studio server status
+	lmstudioLoadedModels  []macos.LMStudioModel // Currently loaded models
+	lmstudioMutex        sync.RWMutex
 }
 
 type config struct {
@@ -87,6 +90,8 @@ type config struct {
 	Topic            string `yaml:"mqtt_topic"`
 	DiscoveryPrefix  string `yaml:"discovery_prefix"`
 	IdleActivityTime int    `yaml:"idle_activity_time"` // in seconds
+	LMStudioEnabled  bool   `yaml:"lmstudio_enabled"`   // Enable LM Studio integration
+	LMStudioAPIURL   string `yaml:"lmstudio_api_url"`   // LM Studio API URL (default: http://localhost:1234)
 }
 
 func (c *config) getConfig() *config {
@@ -127,6 +132,9 @@ func (c *config) getConfig() *config {
 	if c.DiscoveryPrefix == "" {
 		c.DiscoveryPrefix = "homeassistant"
 	}
+	if c.LMStudioAPIURL == "" {
+		c.LMStudioAPIURL = "http://localhost:1234"
+	}
 	return c
 }
 
@@ -138,19 +146,25 @@ func NewApplication() (*Application, error) {
 	app.config = &config{}
 	app.config.getConfig()
 
-	// Set hostname
+	// Set hostname and sanitize it (remove spaces and special characters for MQTT topics)
 	if app.config.Hostname == "" {
 		app.hostname = macos.GetHostname()
 	} else {
 		app.hostname = app.config.Hostname
 	}
 
-	// Set topic - append hostname to allow multiple instances
+	// Sanitize hostname for use in MQTT topics (remove spaces and special characters)
+	sanitizedHostname := strings.ReplaceAll(app.hostname, " ", "")
+	sanitizedHostname = strings.ReplaceAll(sanitizedHostname, "/", "")
+	sanitizedHostname = strings.ReplaceAll(sanitizedHostname, "+", "")
+	sanitizedHostname = strings.ReplaceAll(sanitizedHostname, "#", "")
+
+	// Set topic - append sanitized hostname to allow multiple instances
 	if app.config.Topic == "" {
-		app.topic = DefaultTopicPrefix + "/" + app.hostname
+		app.topic = DefaultTopicPrefix + "/" + sanitizedHostname
 	} else {
-		// Append hostname to the configured topic
-		app.topic = app.config.Topic + "/" + app.hostname
+		// Append sanitized hostname to the configured topic
+		app.topic = app.config.Topic + "/" + sanitizedHostname
 	}
 
 	// Validate configuration
@@ -798,6 +812,13 @@ func (app *Application) listen(client mqtt.Client, msg mqtt.Message) {
 	if app.handlePlayPauseCommand(client, topic, payload) {
 		return
 	}
+
+	// Handle LM Studio commands
+	if app.config.LMStudioEnabled {
+		if app.handleLMStudioCommand(client, topic, payload) {
+			return
+		}
+	}
 }
 
 // handleVolumeCommand handles volume control commands
@@ -946,6 +967,159 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 	}
 	return true
 }
+
+// handleLMStudioCommand handles LM Studio control commands
+func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload string) bool {
+	basePrefix := app.getTopicPrefix()
+
+	// Handle server start/stop
+	if topic == basePrefix+"/command/lmstudio_server" {
+		switch payload {
+		case "start":
+			if err := macos.StartLMStudioServer(); err != nil {
+				log.Printf("Failed to start LM Studio server: %v", err)
+			} else {
+				log.Println("LM Studio server start command sent")
+				// Wait a bit for the server to start and then update status
+				time.Sleep(3 * time.Second)
+				app.updateLMStudioStatus(client)
+			}
+		case "stop":
+			if err := macos.StopLMStudioServer(); err != nil {
+				log.Printf("Failed to stop LM Studio server: %v", err)
+			} else {
+				log.Println("LM Studio server stop command sent")
+				// Wait a bit for the server to stop and then update status
+				time.Sleep(2 * time.Second)
+				app.updateLMStudioStatus(client)
+			}
+		default:
+			log.Printf("Unknown LM Studio server command: %s", payload)
+		}
+		return true
+	}
+
+	// Handle model load
+	if topic == basePrefix+"/command/lmstudio_load_model" {
+		if payload == "" {
+			log.Println("Empty model ID provided for load command")
+			return true
+		}
+
+		if err := macos.LoadLMStudioModel(payload); err != nil {
+			log.Printf("Failed to load model %s: %v", payload, err)
+			client.Publish(basePrefix+"/status/lmstudio_last_error", 0, false, fmt.Sprintf("Failed to load model: %v", err))
+		} else {
+			log.Printf("Model %s load command sent", payload)
+			// Wait a bit for the model to load and then update status
+			time.Sleep(5 * time.Second)
+			app.updateLMStudioStatus(client)
+		}
+		return true
+	}
+
+	// Handle model unload
+	if topic == basePrefix+"/command/lmstudio_unload_model" {
+		if payload == "" || payload == "all" {
+			if err := macos.UnloadAllLMStudioModels(); err != nil {
+				log.Printf("Failed to unload all models: %v", err)
+			} else {
+				log.Println("All models unload command sent")
+				time.Sleep(2 * time.Second)
+				app.updateLMStudioStatus(client)
+			}
+		} else {
+			if err := macos.UnloadLMStudioModel(payload); err != nil {
+				log.Printf("Failed to unload model %s: %v", payload, err)
+			} else {
+				log.Printf("Model %s unload command sent", payload)
+				time.Sleep(2 * time.Second)
+				app.updateLMStudioStatus(client)
+			}
+		}
+		return true
+	}
+
+	return false
+}
+
+// updateLMStudioStatus updates the MQTT topics with current LM Studio status
+func (app *Application) updateLMStudioStatus(client mqtt.Client) {
+	if !app.config.LMStudioEnabled {
+		return
+	}
+
+	basePrefix := app.getTopicPrefix()
+
+	// Check if server is running
+	isRunning, err := macos.GetLMStudioServerStatus(app.config.LMStudioAPIURL)
+	if err != nil {
+		log.Printf("Error checking LM Studio server status: %v", err)
+		return
+	}
+
+	app.lmstudioMutex.Lock()
+	app.lmstudioServerRunning = isRunning
+	app.lmstudioMutex.Unlock()
+
+	// Publish server status
+	serverStatus := "offline"
+	if isRunning {
+		serverStatus = "online"
+	}
+	client.Publish(basePrefix+"/status/lmstudio_server", 0, false, serverStatus)
+
+	if !isRunning {
+		// Server is not running, clear model lists
+		client.Publish(basePrefix+"/status/lmstudio_loaded_models", 0, false, "[]")
+		client.Publish(basePrefix+"/status/lmstudio_available_models", 0, false, "[]")
+		return
+	}
+
+	// Get all models
+	models, err := macos.ListLMStudioModels(app.config.LMStudioAPIURL)
+	if err != nil {
+		log.Printf("Error listing LM Studio models: %v", err)
+		return
+	}
+
+	// Separate loaded and available models
+	var loadedModels []macos.LMStudioModel
+	var availableModels []macos.LMStudioModel
+
+	for _, model := range models {
+		if model.State == "loaded" {
+			loadedModels = append(loadedModels, model)
+		} else {
+			availableModels = append(availableModels, model)
+		}
+	}
+
+	app.lmstudioMutex.Lock()
+	app.lmstudioLoadedModels = loadedModels
+	app.lmstudioMutex.Unlock()
+
+	// Publish loaded models
+	loadedJSON, _ := json.Marshal(loadedModels)
+	client.Publish(basePrefix+"/status/lmstudio_loaded_models", 0, false, string(loadedJSON))
+
+	// Publish available models
+	availableJSON, _ := json.Marshal(availableModels)
+	client.Publish(basePrefix+"/status/lmstudio_available_models", 0, false, string(availableJSON))
+
+	// Publish model count
+	client.Publish(basePrefix+"/status/lmstudio_loaded_models_count", 0, false, strconv.Itoa(len(loadedModels)))
+	client.Publish(basePrefix+"/status/lmstudio_available_models_count", 0, false, strconv.Itoa(len(availableModels)))
+
+	// Publish formatted model lists
+	loadedList := macos.FormatModelList(loadedModels)
+	availableList := macos.FormatModelList(availableModels)
+	client.Publish(basePrefix+"/status/lmstudio_loaded_models_list", 0, false, loadedList)
+	client.Publish(basePrefix+"/status/lmstudio_available_models_list", 0, false, availableList)
+
+	log.Printf("LM Studio status updated: Server=%s, Loaded=%d, Available=%d", serverStatus, len(loadedModels), len(availableModels))
+}
+
 
 func (app *Application) updateVolume(client mqtt.Client) {
 	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(macos.GetVolume()))
@@ -1472,6 +1646,78 @@ func (app *Application) setDevice(client mqtt.Client) {
 		components["display_"+display.DisplayID+"_brightness"] = displayBrightness
 	}
 
+	// Add LM Studio control components if enabled
+	if app.config.LMStudioEnabled && macos.IsLMStudioCLIAvailable() {
+		// Server control switch
+		lmstudioServer := map[string]interface{}{
+			"p":             "switch",
+			"name":          "LM Studio Server",
+			"unique_id":     app.hostname + "_lmstudio_server",
+			"command_topic": app.getTopicPrefix() + "/command/lmstudio_server",
+			"state_topic":   app.getTopicPrefix() + "/status/lmstudio_server",
+			"payload_on":    "start",
+			"payload_off":   "stop",
+			"state_on":      "online",
+			"state_off":     "offline",
+			"icon":          "mdi:server",
+		}
+		components["lmstudio_server"] = lmstudioServer
+
+		// Loaded models sensor
+		lmstudioLoadedModels := map[string]interface{}{
+			"p":           "sensor",
+			"name":        "LM Studio Loaded Models",
+			"unique_id":   app.hostname + "_lmstudio_loaded_models_list",
+			"state_topic": app.getTopicPrefix() + "/status/lmstudio_loaded_models_list",
+			"icon":        "mdi:brain",
+		}
+		components["lmstudio_loaded_models_list"] = lmstudioLoadedModels
+
+		// Available models sensor
+		lmstudioAvailableModels := map[string]interface{}{
+			"p":           "sensor",
+			"name":        "LM Studio Available Models",
+			"unique_id":   app.hostname + "_lmstudio_available_models_list",
+			"state_topic": app.getTopicPrefix() + "/status/lmstudio_available_models_list",
+			"icon":        "mdi:database",
+		}
+		components["lmstudio_available_models_list"] = lmstudioAvailableModels
+
+		// Loaded models count
+		lmstudioLoadedCount := map[string]interface{}{
+			"p":                   "sensor",
+			"name":                "LM Studio Loaded Models Count",
+			"unique_id":           app.hostname + "_lmstudio_loaded_models_count",
+			"state_topic":         app.getTopicPrefix() + "/status/lmstudio_loaded_models_count",
+			"unit_of_measurement": "models",
+			"state_class":         "measurement",
+			"icon":                "mdi:counter",
+		}
+		components["lmstudio_loaded_models_count"] = lmstudioLoadedCount
+
+		// Load model text input (for manual model ID entry)
+		lmstudioLoadModel := map[string]interface{}{
+			"p":             "text",
+			"name":          "LM Studio Load Model",
+			"unique_id":     app.hostname + "_lmstudio_load_model",
+			"command_topic": app.getTopicPrefix() + "/command/lmstudio_load_model",
+			"icon":          "mdi:upload",
+			"mode":          "text",
+		}
+		components["lmstudio_load_model"] = lmstudioLoadModel
+
+		// Unload model text input (for manual model ID entry or "all")
+		lmstudioUnloadModel := map[string]interface{}{
+			"p":             "text",
+			"name":          "LM Studio Unload Model",
+			"unique_id":     app.hostname + "_lmstudio_unload_model",
+			"command_topic": app.getTopicPrefix() + "/command/lmstudio_unload_model",
+			"icon":          "mdi:download",
+			"mode":          "text",
+		}
+		components["lmstudio_unload_model"] = lmstudioUnloadModel
+	}
+
 	origin := map[string]interface{}{
 		"name": "mac2mqtt",
 	}
@@ -1541,6 +1787,23 @@ func (app *Application) Run() error {
 	}
 	log.Println("=== MEDIA CONTROL CHECK COMPLETE ===")
 
+	// Check LM Studio availability
+	if app.config.LMStudioEnabled {
+		log.Println("=== CHECKING LM STUDIO ===")
+		if macos.IsLMStudioCLIAvailable() {
+			log.Println("LM Studio CLI (lms) is available - LM Studio control will be enabled")
+			log.Printf("LM Studio API URL: %s", app.config.LMStudioAPIURL)
+		} else {
+			log.Println("LM Studio CLI (lms) is not installed or not accessible")
+			log.Println("To install LM Studio:")
+			log.Println("  1. Download from https://lmstudio.ai/download")
+			log.Println("  2. Run LM Studio at least once to install CLI tools")
+			log.Println("LM Studio control will be disabled until CLI is available")
+			app.config.LMStudioEnabled = false
+		}
+		log.Println("=== LM STUDIO CHECK COMPLETE ===")
+	}
+
 	log.Println("Starting MQTT connection...")
 	if err := app.getMQTTClient(); err != nil {
 		log.Printf("Initial MQTT connection failed: %v", err)
@@ -1583,6 +1846,11 @@ func (app *Application) Run() error {
 		app.updateMediaDevices(app.client)               // Initial media devices update
 		app.updatePublicIP(app.client)                   // Initial public IP update
 
+		// Update LM Studio status if enabled
+		if app.config.LMStudioEnabled {
+			app.updateLMStudioStatus(app.client)
+		}
+
 		// Start media stream for real-time updates
 		app.startMediaStream(app.client)
 
@@ -1622,6 +1890,11 @@ func (app *Application) Run() error {
 			if app.client.IsConnected() {
 				app.updateCaffeinateStatus(app.client)
 				app.updateDisplayBrightness(app.client)
+
+				// Update LM Studio status if enabled
+				if app.config.LMStudioEnabled {
+					app.updateLMStudioStatus(app.client)
+				}
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping status updates")
 			}

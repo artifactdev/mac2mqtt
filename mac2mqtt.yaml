@@ -1,8 +1,11 @@
-mqtt_ip: 192.168.120.254
+mqtt_ip: 192.168.188.54
 mqtt_port: 1883
-mqtt_user: hass
-mqtt_password: password
+mqtt_user: mqtt_user
+mqtt_password: mqtt
 mqtt_ssl: false
-hostname: macbook-air-2
-mqtt_topic: iot/MyMac
-idle_activity_time: 30
+hostname: Mac_Mini
+mqtt_topic: computer
+# LM Studio Integration (optional)
+# Enable to control LM Studio server and models via MQTT
+lmstudio_enabled: true
+lmstudio_api_url: http://localhost:1234

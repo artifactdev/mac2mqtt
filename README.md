@@ -11,6 +11,7 @@ It publishes to MQTT:
  * battery charge percent
  * **media player information (title, artist, album, app name, state)**
  * **user activity status (active/inactive with 10-second timeout)**
+ * **LM Studio server status and loaded models (optional)**
 
 You can send topics to:
 
@@ -21,6 +22,8 @@ You can send topics to:
  * turn off the display
  * wake display
  * run macOS shortcuts
+ * **start/stop LM Studio server (optional)**
+ * **load/unload LM Studio models (optional)**
 
 ## Dependencies
 
@@ -36,7 +39,11 @@ You can send topics to:
   - Install via npm: `npm install -g media-control`
   - Or install via Homebrew: `brew install media-control`
   - Provides current media playback information (title, artist, album, app name, state, duration, position)
-r:
+- **LM Studio** - for AI model server control
+  - Download from https://lmstudio.ai/download
+  - Run LM Studio at least once to install CLI tools
+  - Enables starting/stopping the server and loading/unloading models via MQTT
+  - See [LMSTUDIO_INTEGRATION.md](LMSTUDIO_INTEGRATION.md) for detailed setup and usage
 
 
 
@@ -247,7 +254,7 @@ This sensor monitors system idle time and provides instant updates when user int
 
 **Features:**
 - **Instant detection**: No polling delays - activity is detected immediately
-- **Automatic timeout**: Switches to inactive after exactly 10 seconds of inactivity  
+- **Automatic timeout**: Switches to inactive after exactly 10 seconds of inactivity
 - **System-level monitoring**: Uses macOS IOHIDSystem to track all user input
 - **Event-driven**: Updates are published only when state changes occur
 - **Home Assistant integration**: Appears as an occupancy sensor with device class `occupancy`
