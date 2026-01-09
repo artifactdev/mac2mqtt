@@ -77,7 +77,10 @@ type Application struct {
 	cpuMutex          sync.RWMutex
 	lmstudioServerRunning bool                 // LM Studio server status
 	lmstudioLoadedModels  []macos.LMStudioModel // Currently loaded models
+	lmstudioAllModels     []macos.LMStudioModel // All models (loaded + available)
 	lmstudioMutex        sync.RWMutex
+	lastNetworkStats     *macos.NetworkStats // For network speed calculation
+	lastNetworkTime      time.Time           // Last network stats update time
 }
 
 type config struct {
@@ -999,42 +1002,51 @@ func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload
 		return true
 	}
 
-	// Handle model load
-	if topic == basePrefix+"/command/lmstudio_load_model" {
-		if payload == "" {
-			log.Println("Empty model ID provided for load command")
+	// Handle individual model switches (lmstudio_model_*)
+	if strings.HasPrefix(topic, basePrefix+"/command/lmstudio_model_") {
+		// Extract sanitized model ID from topic
+		sanitizedID := strings.TrimPrefix(topic, basePrefix+"/command/lmstudio_model_")
+
+		// Find the actual model ID from our model list
+		app.lmstudioMutex.RLock()
+		models := app.lmstudioAllModels
+		app.lmstudioMutex.RUnlock()
+
+		var actualModelID string
+		for _, model := range models {
+			if sanitizeModelID(model.ID) == sanitizedID {
+				actualModelID = model.ID
+				break
+			}
+		}
+
+		if actualModelID == "" {
+			log.Printf("Could not find model with sanitized ID: %s", sanitizedID)
 			return true
 		}
 
-		if err := macos.LoadLMStudioModel(payload); err != nil {
-			log.Printf("Failed to load model %s: %v", payload, err)
-			client.Publish(basePrefix+"/status/lmstudio_last_error", 0, false, fmt.Sprintf("Failed to load model: %v", err))
-		} else {
-			log.Printf("Model %s load command sent", payload)
-			// Wait a bit for the model to load and then update status
-			time.Sleep(5 * time.Second)
-			app.updateLMStudioStatus(client)
-		}
-		return true
-	}
-
-	// Handle model unload
-	if topic == basePrefix+"/command/lmstudio_unload_model" {
-		if payload == "" || payload == "all" {
-			if err := macos.UnloadAllLMStudioModels(); err != nil {
-				log.Printf("Failed to unload all models: %v", err)
+		// Handle load/unload based on payload
+		if payload == "load" {
+			if err := macos.LoadLMStudioModel(actualModelID); err != nil {
+				log.Printf("Failed to load model %s: %v", actualModelID, err)
 			} else {
-				log.Println("All models unload command sent")
-				time.Sleep(2 * time.Second)
-				app.updateLMStudioStatus(client)
+				log.Printf("Model %s load command sent", actualModelID)
+				// Update status after a delay
+				go func() {
+					time.Sleep(5 * time.Second)
+					app.updateLMStudioStatus(client)
+				}()
 			}
-		} else {
-			if err := macos.UnloadLMStudioModel(payload); err != nil {
-				log.Printf("Failed to unload model %s: %v", payload, err)
+		} else if payload == "unload" {
+			if err := macos.UnloadLMStudioModel(actualModelID); err != nil {
+				log.Printf("Failed to unload model %s: %v", actualModelID, err)
 			} else {
-				log.Printf("Model %s unload command sent", payload)
-				time.Sleep(2 * time.Second)
-				app.updateLMStudioStatus(client)
+				log.Printf("Model %s unload command sent", actualModelID)
+				// Update status after a delay
+				go func() {
+					time.Sleep(2 * time.Second)
+					app.updateLMStudioStatus(client)
+				}()
 			}
 		}
 		return true
@@ -1060,6 +1072,7 @@ func (app *Application) updateLMStudioStatus(client mqtt.Client) {
 
 	app.lmstudioMutex.Lock()
 	app.lmstudioServerRunning = isRunning
+	oldModels := app.lmstudioAllModels
 	app.lmstudioMutex.Unlock()
 
 	// Publish server status
@@ -1070,9 +1083,11 @@ func (app *Application) updateLMStudioStatus(client mqtt.Client) {
 	client.Publish(basePrefix+"/status/lmstudio_server", 0, false, serverStatus)
 
 	if !isRunning {
-		// Server is not running, clear model lists
-		client.Publish(basePrefix+"/status/lmstudio_loaded_models", 0, false, "[]")
-		client.Publish(basePrefix+"/status/lmstudio_available_models", 0, false, "[]")
+		// Server is not running, set all model switches to OFF
+		for _, model := range oldModels {
+			sanitizedID := sanitizeModelID(model.ID)
+			client.Publish(basePrefix+"/status/lmstudio_model_"+sanitizedID, 0, true, "OFF")
+		}
 		return
 	}
 
@@ -1083,41 +1098,68 @@ func (app *Application) updateLMStudioStatus(client mqtt.Client) {
 		return
 	}
 
-	// Separate loaded and available models
-	var loadedModels []macos.LMStudioModel
-	var availableModels []macos.LMStudioModel
-
+	// Count loaded models
+	loadedCount := 0
 	for _, model := range models {
 		if model.State == "loaded" {
-			loadedModels = append(loadedModels, model)
-		} else {
-			availableModels = append(availableModels, model)
+			loadedCount++
 		}
 	}
 
 	app.lmstudioMutex.Lock()
-	app.lmstudioLoadedModels = loadedModels
+	app.lmstudioAllModels = models
 	app.lmstudioMutex.Unlock()
 
-	// Publish loaded models
-	loadedJSON, _ := json.Marshal(loadedModels)
-	client.Publish(basePrefix+"/status/lmstudio_loaded_models", 0, false, string(loadedJSON))
+	// Check if model list has changed - if yes, republish Discovery
+	modelsChanged := len(models) != len(oldModels)
+	if !modelsChanged {
+		for i, model := range models {
+			if i >= len(oldModels) || model.ID != oldModels[i].ID {
+				modelsChanged = true
+				break
+			}
+		}
+	}
 
-	// Publish available models
-	availableJSON, _ := json.Marshal(availableModels)
-	client.Publish(basePrefix+"/status/lmstudio_available_models", 0, false, string(availableJSON))
+	if modelsChanged {
+		log.Printf("Model list changed, republishing Discovery messages")
+		app.publishLMStudioModelDiscovery(client)
+	}
+
+	// Publish state for each model
+	for _, model := range models {
+		sanitizedID := sanitizeModelID(model.ID)
+		state := "OFF"
+		if model.State == "loaded" {
+			state = "ON"
+		}
+		client.Publish(basePrefix+"/status/lmstudio_model_"+sanitizedID, 0, true, state)
+	}
 
 	// Publish model count
-	client.Publish(basePrefix+"/status/lmstudio_loaded_models_count", 0, false, strconv.Itoa(len(loadedModels)))
-	client.Publish(basePrefix+"/status/lmstudio_available_models_count", 0, false, strconv.Itoa(len(availableModels)))
+	client.Publish(basePrefix+"/status/lmstudio_loaded_models_count", 0, false, strconv.Itoa(loadedCount))
 
-	// Publish formatted model lists
-	loadedList := macos.FormatModelList(loadedModels)
-	availableList := macos.FormatModelList(availableModels)
-	client.Publish(basePrefix+"/status/lmstudio_loaded_models_list", 0, false, loadedList)
-	client.Publish(basePrefix+"/status/lmstudio_available_models_list", 0, false, availableList)
+	log.Printf("LM Studio status updated: Server=%s, Loaded=%d, Total=%d", serverStatus, loadedCount, len(models))
+}
 
-	log.Printf("LM Studio status updated: Server=%s, Loaded=%d, Available=%d", serverStatus, len(loadedModels), len(availableModels))
+// sanitizeModelID converts a model ID to a valid Home Assistant entity ID
+func sanitizeModelID(id string) string {
+	// Replace all non-alphanumeric characters with underscore
+	sanitized := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '_'
+	}, id)
+	// Convert to lowercase
+	sanitized = strings.ToLower(sanitized)
+	// Remove multiple consecutive underscores
+	for strings.Contains(sanitized, "__") {
+		sanitized = strings.ReplaceAll(sanitized, "__", "_")
+	}
+	// Trim underscores from start and end
+	sanitized = strings.Trim(sanitized, "_")
+	return sanitized
 }
 
 
@@ -1239,9 +1281,47 @@ func (app *Application) updateUptime(client mqtt.Client) {
 		return
 	}
 
-	// Publish uptime metrics
+	// Publish uptime
 	client.Publish(app.getTopicPrefix()+"/status/uptime/seconds", 0, false, fmt.Sprintf("%d", uptime.Seconds))
 	client.Publish(app.getTopicPrefix()+"/status/uptime/human", 0, false, uptime.Human)
+}
+
+func (app *Application) updateTemperatures(client mqtt.Client) {
+	temps, err := macos.GetTemperatures()
+	if err != nil {
+		log.Printf("Failed to get temperatures: %v", err)
+		return
+	}
+
+	// Publish temperature metrics
+	client.Publish(app.getTopicPrefix()+"/status/temperature/cpu", 0, false, fmt.Sprintf("%.1f", temps.CPU))
+	if temps.GPU > 0 {
+		client.Publish(app.getTopicPrefix()+"/status/temperature/gpu", 0, false, fmt.Sprintf("%.1f", temps.GPU))
+	}
+}
+
+func (app *Application) updateNetworkStats(client mqtt.Client) {
+	now := time.Now()
+	var interval time.Duration
+	if !app.lastNetworkTime.IsZero() {
+		interval = now.Sub(app.lastNetworkTime)
+	}
+
+	stats, err := macos.GetNetworkStats(app.lastNetworkStats, interval)
+	if err != nil {
+		log.Printf("Failed to get network stats: %v", err)
+		return
+	}
+
+	// Update stored values
+	app.lastNetworkStats = stats
+	app.lastNetworkTime = now
+
+	// Publish network metrics
+	client.Publish(app.getTopicPrefix()+"/status/network/bytes_received", 0, false, fmt.Sprintf("%d", stats.BytesRecv))
+	client.Publish(app.getTopicPrefix()+"/status/network/bytes_sent", 0, false, fmt.Sprintf("%d", stats.BytesSent))
+	client.Publish(app.getTopicPrefix()+"/status/network/download_speed", 0, false, fmt.Sprintf("%.2f", stats.DownloadMbps))
+	client.Publish(app.getTopicPrefix()+"/status/network/upload_speed", 0, false, fmt.Sprintf("%.2f", stats.UploadMbps))
 }
 
 func (app *Application) updateMediaDevices(client mqtt.Client) {
@@ -1548,6 +1628,72 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"icon":        "mdi:ip-network",
 	}
 
+	cpuTemp := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "CPU Temperature",
+		"unique_id":           app.hostname + "_cpu_temperature",
+		"state_topic":         app.getTopicPrefix() + "/status/temperature/cpu",
+		"unit_of_measurement": "°C",
+		"device_class":        "temperature",
+		"state_class":         "measurement",
+		"icon":                "mdi:thermometer",
+	}
+
+	gpuTemp := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "GPU Temperature",
+		"unique_id":           app.hostname + "_gpu_temperature",
+		"state_topic":         app.getTopicPrefix() + "/status/temperature/gpu",
+		"unit_of_measurement": "°C",
+		"device_class":        "temperature",
+		"state_class":         "measurement",
+		"icon":                "mdi:thermometer",
+	}
+
+	networkBytesRecv := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Network Bytes Received",
+		"unique_id":           app.hostname + "_network_bytes_received",
+		"state_topic":         app.getTopicPrefix() + "/status/network/bytes_received",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "total_increasing",
+		"icon":                "mdi:download",
+	}
+
+	networkBytesSent := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Network Bytes Sent",
+		"unique_id":           app.hostname + "_network_bytes_sent",
+		"state_topic":         app.getTopicPrefix() + "/status/network/bytes_sent",
+		"unit_of_measurement": "B",
+		"device_class":        "data_size",
+		"state_class":         "total_increasing",
+		"icon":                "mdi:upload",
+	}
+
+	networkDownloadSpeed := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Network Download Speed",
+		"unique_id":           app.hostname + "_network_download_speed",
+		"state_topic":         app.getTopicPrefix() + "/status/network/download_speed",
+		"unit_of_measurement": "Mbps",
+		"device_class":        "data_rate",
+		"state_class":         "measurement",
+		"icon":                "mdi:download-network",
+	}
+
+	networkUploadSpeed := map[string]interface{}{
+		"p":                   "sensor",
+		"name":                "Network Upload Speed",
+		"unique_id":           app.hostname + "_network_upload_speed",
+		"state_topic":         app.getTopicPrefix() + "/status/network/upload_speed",
+		"unit_of_measurement": "Mbps",
+		"device_class":        "data_rate",
+		"state_class":         "measurement",
+		"icon":                "mdi:upload-network",
+	}
+
 	components := map[string]interface{}{
 		"sleep":               sleep,
 		"shutdown":            shutdown,
@@ -1575,6 +1721,12 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"microphone":          microphone,
 		"camera":              camera,
 		"public_ip":           publicIP,
+		"cpu_temperature":     cpuTemp,
+		"gpu_temperature":     gpuTemp,
+		"network_bytes_received": networkBytesRecv,
+		"network_bytes_sent":     networkBytesSent,
+		"network_download_speed": networkDownloadSpeed,
+		"network_upload_speed":   networkUploadSpeed,
 	}
 
 	// Add user activity sensor
@@ -1665,21 +1817,23 @@ func (app *Application) setDevice(client mqtt.Client) {
 
 		// Loaded models sensor
 		lmstudioLoadedModels := map[string]interface{}{
-			"p":           "sensor",
-			"name":        "LM Studio Loaded Models",
-			"unique_id":   app.hostname + "_lmstudio_loaded_models_list",
-			"state_topic": app.getTopicPrefix() + "/status/lmstudio_loaded_models_list",
-			"icon":        "mdi:brain",
+			"p":                     "sensor",
+			"name":                  "LM Studio Loaded Models",
+			"unique_id":             app.hostname + "_lmstudio_loaded_models_list",
+			"state_topic":           app.getTopicPrefix() + "/status/lmstudio_loaded_models_list",
+			"json_attributes_topic": app.getTopicPrefix() + "/status/lmstudio_loaded_models",
+			"icon":                  "mdi:brain",
 		}
 		components["lmstudio_loaded_models_list"] = lmstudioLoadedModels
 
 		// Available models sensor
 		lmstudioAvailableModels := map[string]interface{}{
-			"p":           "sensor",
-			"name":        "LM Studio Available Models",
-			"unique_id":   app.hostname + "_lmstudio_available_models_list",
-			"state_topic": app.getTopicPrefix() + "/status/lmstudio_available_models_list",
-			"icon":        "mdi:database",
+			"p":                     "sensor",
+			"name":                  "LM Studio Available Models",
+			"unique_id":             app.hostname + "_lmstudio_available_models_list",
+			"state_topic":           app.getTopicPrefix() + "/status/lmstudio_available_models_list",
+			"json_attributes_topic": app.getTopicPrefix() + "/status/lmstudio_available_models",
+			"icon":                  "mdi:database",
 		}
 		components["lmstudio_available_models_list"] = lmstudioAvailableModels
 
@@ -1738,10 +1892,122 @@ func (app *Application) setDevice(client mqtt.Client) {
 	}
 	objectJSON, _ := json.Marshal(object)
 
-	token := client.Publish(app.config.DiscoveryPrefix+"/device"+"/"+app.hostname+"/config", 0, true, objectJSON)
+	discoveryTopic := app.config.DiscoveryPrefix + "/device" + "/" + app.hostname + "/config"
+	log.Printf("Publishing MQTT Discovery to topic: %s", discoveryTopic)
+	log.Printf("Discovery payload includes %d components", len(components))
+
+	token := client.Publish(discoveryTopic, 0, true, objectJSON)
 	token.Wait()
 
+	// Publish separate LM Studio entities for better Home Assistant compatibility
+	if app.config.LMStudioEnabled && macos.IsLMStudioCLIAvailable() {
+		app.publishLMStudioDiscovery(client, device, origin)
+	}
+
 	// Note: Media player functionality replaced with play/pause button and now playing sensor
+}
+
+// publishLMStudioDiscovery publishes separate MQTT Discovery messages for LM Studio entities
+func (app *Application) publishLMStudioDiscovery(client mqtt.Client, device map[string]interface{}, origin map[string]interface{}) {
+	basePrefix := app.getTopicPrefix()
+	discoveryPrefix := app.config.DiscoveryPrefix
+
+	// Server control switch
+	serverConfig := map[string]interface{}{
+		"name":              "LM Studio Server",
+		"unique_id":         app.hostname + "_lmstudio_server",
+		"command_topic":     basePrefix + "/command/lmstudio_server",
+		"state_topic":       basePrefix + "/status/lmstudio_server",
+		"payload_on":        "start",
+		"payload_off":       "stop",
+		"state_on":          "online",
+		"state_off":         "offline",
+		"icon":              "mdi:server",
+		"device":            device,
+		"origin":            origin,
+		"availability_topic": basePrefix + "/status/alive",
+	}
+	serverJSON, _ := json.Marshal(serverConfig)
+	client.Publish(discoveryPrefix+"/switch/"+app.hostname+"/lmstudio_server/config", 0, true, serverJSON)
+
+	// Loaded models count sensor
+	loadedCountConfig := map[string]interface{}{
+		"name":                  "LM Studio Loaded Models Count",
+		"unique_id":             app.hostname + "_lmstudio_loaded_models_count",
+		"state_topic":           basePrefix + "/status/lmstudio_loaded_models_count",
+		"unit_of_measurement":   "models",
+		"state_class":           "measurement",
+		"icon":                  "mdi:counter",
+		"device":                device,
+		"origin":                origin,
+		"availability_topic":    basePrefix + "/status/alive",
+	}
+	loadedCountJSON, _ := json.Marshal(loadedCountConfig)
+	client.Publish(discoveryPrefix+"/sensor/"+app.hostname+"/lmstudio_loaded_models_count/config", 0, true, loadedCountJSON)
+
+	log.Printf("Published %d LM Studio base Discovery messages", 2)
+
+	// Publish Discovery for all models
+	app.publishLMStudioModelDiscovery(client)
+}
+
+// publishLMStudioModelDiscovery publishes Discovery messages for individual model switches
+func (app *Application) publishLMStudioModelDiscovery(client mqtt.Client) {
+	if !app.config.LMStudioEnabled {
+		return
+	}
+
+	basePrefix := app.getTopicPrefix()
+	discoveryPrefix := app.config.DiscoveryPrefix
+
+	// Get device and origin info
+	device := map[string]interface{}{
+		"identifiers":  []string{app.hostname},
+		"name":         app.hostname,
+		"manufacturer": "Apple",
+		"model":        "Mac",
+	}
+
+	origin := map[string]interface{}{
+		"name": "mac2mqtt",
+		"sw":   "1.0.0",
+	}
+
+	app.lmstudioMutex.RLock()
+	models := app.lmstudioAllModels
+	app.lmstudioMutex.RUnlock()
+
+	for _, model := range models {
+		sanitizedID := sanitizeModelID(model.ID)
+
+		// Create a friendly name from the model ID
+		modelName := model.ID
+		if len(modelName) > 50 {
+			modelName = modelName[:47] + "..."
+		}
+
+		modelConfig := map[string]interface{}{
+			"name":               modelName,
+			"unique_id":          app.hostname + "_lmstudio_model_" + sanitizedID,
+			"command_topic":      basePrefix + "/command/lmstudio_model_" + sanitizedID,
+			"state_topic":        basePrefix + "/status/lmstudio_model_" + sanitizedID,
+			"payload_on":         "load",
+			"payload_off":        "unload",
+			"state_on":           "ON",
+			"state_off":          "OFF",
+			"icon":               "mdi:brain",
+			"device":             device,
+			"origin":             origin,
+			"availability_topic": basePrefix + "/status/alive",
+		}
+		modelJSON, _ := json.Marshal(modelConfig)
+		// Use object_id to ensure the entity ID includes lmstudio_model_ prefix
+		modelConfig["object_id"] = "lmstudio_model_" + sanitizedID
+		modelJSON, _ = json.Marshal(modelConfig)
+		client.Publish(discoveryPrefix+"/switch/"+app.hostname+"/lmstudio_model_"+sanitizedID+"/config", 0, true, modelJSON)
+	}
+
+	log.Printf("Published Discovery for %d LM Studio model switches", len(models))
 }
 
 // handleOfflineMode manages application behavior when MQTT broker is unreachable
@@ -1820,10 +2086,12 @@ func (app *Application) Run() error {
 	volumeTicker := time.NewTicker(UpdateInterval)
 	batteryTicker := time.NewTicker(UpdateInterval)
 	awakeTicker := time.NewTicker(UpdateInterval)
+	lmStudioTicker := time.NewTicker(15 * time.Second) // LM Studio updates every 15 seconds
 	networkCheckTicker := time.NewTicker(30 * time.Second) // Check network every 30 seconds
 	defer volumeTicker.Stop()
 	defer batteryTicker.Stop()
 	defer awakeTicker.Stop()
+	defer lmStudioTicker.Stop()
 	defer networkCheckTicker.Stop()
 
 	// Track connection state
@@ -1845,6 +2113,8 @@ func (app *Application) Run() error {
 		app.updateUptime(app.client)                     // Initial uptime update
 		app.updateMediaDevices(app.client)               // Initial media devices update
 		app.updatePublicIP(app.client)                   // Initial public IP update
+		app.updateTemperatures(app.client)               // Initial temperature update
+		app.updateNetworkStats(app.client)               // Initial network stats update
 
 		// Update LM Studio status if enabled
 		if app.config.LMStudioEnabled {
@@ -1882,6 +2152,8 @@ func (app *Application) Run() error {
 				app.updateMemoryUsage(app.client)
 				app.updateUptime(app.client)
 				app.updatePublicIP(app.client)
+				app.updateTemperatures(app.client)
+				app.updateNetworkStats(app.client)
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping battery update")
 			}
@@ -1890,15 +2162,16 @@ func (app *Application) Run() error {
 			if app.client.IsConnected() {
 				app.updateCaffeinateStatus(app.client)
 				app.updateDisplayBrightness(app.client)
-
-				// Update LM Studio status if enabled
-				if app.config.LMStudioEnabled {
-					app.updateLMStudioStatus(app.client)
-				}
 			} else if networkReachable {
 				log.Println("MQTT client not connected but network is reachable, skipping status updates")
 			}
 			// Note: Media updates now come from the media-control stream
+
+		case <-lmStudioTicker.C:
+			// Update LM Studio status every 15 seconds if enabled
+			if app.config.LMStudioEnabled && app.client.IsConnected() {
+				app.updateLMStudioStatus(app.client)
+			}
 
 		case <-networkCheckTicker.C:
 			// Periodic network reachability check

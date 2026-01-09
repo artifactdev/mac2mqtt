@@ -46,6 +46,20 @@ type UptimeInfo struct {
 	Human   string `json:"human"`   // Human-readable format
 }
 
+// TemperatureInfo holds system temperature information
+type TemperatureInfo struct {
+	CPU float64 `json:"cpu"` // CPU temperature in Celsius
+	GPU float64 `json:"gpu"` // GPU temperature in Celsius
+}
+
+// NetworkStats holds network statistics
+type NetworkStats struct {
+	BytesRecv   uint64  `json:"bytes_recv"`   // Total bytes received
+	BytesSent   uint64  `json:"bytes_sent"`   // Total bytes sent
+	DownloadMbps float64 `json:"download_mbps"` // Download speed in Mbps
+	UploadMbps   float64 `json:"upload_mbps"`   // Upload speed in Mbps
+}
+
 // GetDiskUsage returns disk usage statistics for the root filesystem
 func GetDiskUsage() (*DiskUsage, error) {
 	fs := sigar.FileSystemList{}
@@ -270,4 +284,150 @@ func GetPublicIP() (string, error) {
 	// The first TXT record contains the IP address
 	publicIP := strings.TrimSpace(txtRecords[0])
 	return publicIP, nil
+}
+
+// GetCPUTemperature returns the CPU temperature in Celsius using powermetrics
+func GetCPUTemperature() (float64, error) {
+	cmd := exec.Command("sudo", "powermetrics", "-n", "1", "-i", "1000", "--samplers", "smc")
+	output, err := cmd.Output()
+	if err != nil {
+		// Try alternative method using osx-cpu-temp if powermetrics fails
+		return getCPUTempAlternative()
+	}
+
+	// Parse CPU die temperature from powermetrics output
+	re := regexp.MustCompile(`CPU die temperature: ([\d.]+) C`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) >= 2 {
+		temp, err := strconv.ParseFloat(matches[1], 64)
+		if err == nil {
+			return temp, nil
+		}
+	}
+
+	return 0, fmt.Errorf("could not parse CPU temperature from powermetrics")
+}
+
+// getCPUTempAlternative tries to get CPU temperature using sysctl (less accurate but no sudo required)
+func getCPUTempAlternative() (float64, error) {
+	cmd := exec.Command("sysctl", "machdep.xcpm.cpu_thermal_level")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get CPU thermal level: %w", err)
+	}
+
+	// Parse thermal level (0-100, where higher means hotter)
+	re := regexp.MustCompile(`machdep\.xcpm\.cpu_thermal_level: (\d+)`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) >= 2 {
+		level, err := strconv.ParseInt(matches[1], 10, 64)
+		if err == nil {
+			// Rough estimate: convert thermal level to temperature (very approximate)
+			// Thermal level 0 = ~40°C, level 100 = ~100°C
+			estimatedTemp := 40.0 + (float64(level) * 0.6)
+			return estimatedTemp, nil
+		}
+	}
+
+	return 0, fmt.Errorf("could not parse CPU thermal level")
+}
+
+// GetGPUTemperature returns the GPU temperature in Celsius
+func GetGPUTemperature() (float64, error) {
+	cmd := exec.Command("sudo", "powermetrics", "-n", "1", "-i", "1000", "--samplers", "smc")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("failed to run powermetrics: %w", err)
+	}
+
+	// Parse GPU die temperature from powermetrics output
+	re := regexp.MustCompile(`GPU die temperature: ([\d.]+) C`)
+	matches := re.FindStringSubmatch(string(output))
+	if len(matches) >= 2 {
+		temp, err := strconv.ParseFloat(matches[1], 64)
+		if err == nil {
+			return temp, nil
+		}
+	}
+
+	// If no GPU temperature found, return 0 (some Macs don't have dedicated GPU)
+	return 0, nil
+}
+
+// GetTemperatures returns CPU and GPU temperatures
+func GetTemperatures() (*TemperatureInfo, error) {
+	cpuTemp, cpuErr := GetCPUTemperature()
+	gpuTemp, _ := GetGPUTemperature() // GPU error is not critical
+
+	if cpuErr != nil {
+		return nil, fmt.Errorf("failed to get CPU temperature: %w", cpuErr)
+	}
+
+	return &TemperatureInfo{
+		CPU: cpuTemp,
+		GPU: gpuTemp,
+	}, nil
+}
+
+// GetNetworkStats returns current network statistics with speed calculation
+func GetNetworkStats(lastStats *NetworkStats, interval time.Duration) (*NetworkStats, error) {
+	// Get network interface statistics using netstat
+	cmd := exec.Command("netstat", "-ibn")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run netstat: %w", err)
+	}
+
+	var totalBytesRecv uint64
+	var totalBytesSent uint64
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+
+		// Skip loopback and non-active interfaces
+		ifName := fields[0]
+		if strings.HasPrefix(ifName, "lo") || ifName == "Name" {
+			continue
+		}
+
+		// Parse bytes received (column 7) and sent (column 10)
+		bytesRecv, err1 := strconv.ParseUint(fields[6], 10, 64)
+		bytesSent, err2 := strconv.ParseUint(fields[9], 10, 64)
+
+		if err1 == nil && err2 == nil {
+			totalBytesRecv += bytesRecv
+			totalBytesSent += bytesSent
+		}
+	}
+
+	// Calculate speeds if we have previous stats
+	var downloadMbps, uploadMbps float64
+	if lastStats != nil && interval.Seconds() > 0 {
+		// Calculate bytes per second
+		bytesRecvDiff := float64(totalBytesRecv - lastStats.BytesRecv)
+		bytesSentDiff := float64(totalBytesSent - lastStats.BytesSent)
+
+		// Convert to Mbps (megabits per second)
+		downloadMbps = (bytesRecvDiff * 8) / (interval.Seconds() * 1000000)
+		uploadMbps = (bytesSentDiff * 8) / (interval.Seconds() * 1000000)
+
+		// Ensure non-negative values
+		if downloadMbps < 0 {
+			downloadMbps = 0
+		}
+		if uploadMbps < 0 {
+			uploadMbps = 0
+		}
+	}
+
+	return &NetworkStats{
+		BytesRecv:   totalBytesRecv,
+		BytesSent:   totalBytesSent,
+		DownloadMbps: downloadMbps,
+		UploadMbps:   uploadMbps,
+	}, nil
 }
