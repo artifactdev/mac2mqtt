@@ -2127,7 +2127,10 @@ func (app *Application) Run() error {
 	defer networkCheckTicker.Stop()
 
 	// Track connection state
-	lastConnectionState := app.client.IsConnected()
+	lastConnectionState := false
+	if app.client != nil {
+		lastConnectionState = app.client.IsConnected()
+	}
 	networkReachable := true
 
 	// Initial setup - only if MQTT is connected

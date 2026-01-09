@@ -19,7 +19,7 @@
         <key>EnvironmentVariables</key>
         <dict>
             <key>PATH</key>
-            <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+            <string>/Users/USERNAME/.lmstudio/bin:/Users/USERNAME/.nvm/versions/node/current/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
             <key>HOME</key>
             <string>/Users/USERNAME</string>
             <key>USER</key>

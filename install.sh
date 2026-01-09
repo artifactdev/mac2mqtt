@@ -74,28 +74,28 @@ check_go() {
 # Function to build the application
 build_application() {
     print_status "Building Mac2MQTT..."
-    
+
     if [ ! -f "mac2mqtt.go" ]; then
         print_error "mac2mqtt.go not found in current directory"
         exit 1
     fi
-    
+
     # Download dependencies
     go mod download
-    
+
     # Build the application
     go build -o mac2mqtt mac2mqtt.go
-    
+
     # Make executable
     chmod +x mac2mqtt
-    
+
     print_success "Mac2MQTT built successfully"
 }
 
 # Function to configure MQTT settings
 configure_mqtt() {
     print_status "Configuring MQTT settings..."
-    
+
     # Check if config file exists
     if [ -f "mac2mqtt.yaml" ]; then
         print_warning "mac2mqtt.yaml already exists. Do you want to overwrite it? (y/N)"
@@ -105,36 +105,36 @@ configure_mqtt() {
             return
         fi
     fi
-    
+
     # Get MQTT configuration from user
     echo ""
     print_status "Please provide your MQTT configuration:"
-    
+
     read -p "MQTT Broker IP/Hostname [192.168.1.250]: " mqtt_ip
     mqtt_ip=${mqtt_ip:-192.168.1.250}
-    
+
     read -p "MQTT Port [1883]: " mqtt_port
     mqtt_port=${mqtt_port:-1883}
-    
+
     read -p "MQTT Username [hass]: " mqtt_user
     mqtt_user=${mqtt_user:-hass}
-    
+
     read -s -p "MQTT Password: " mqtt_password
     echo ""
-    
+
     read -p "Use SSL/TLS? (y/N): " mqtt_ssl_response
     if [[ "$mqtt_ssl_response" =~ ^[Yy]$ ]]; then
         mqtt_ssl="true"
     else
         mqtt_ssl="false"
     fi
-    
+
     read -p "Computer Hostname [$(hostname)]: " hostname
     hostname=${hostname:-$(hostname)}
-    
+
     read -p "MQTT Topic Prefix [iot/MyMac]: " mqtt_topic
     mqtt_topic=${mqtt_topic:-iot/MyMac}
-    
+
     # Create configuration file
     cat > mac2mqtt.yaml << EOF
 mqtt_ip: $mqtt_ip
@@ -145,14 +145,14 @@ mqtt_ssl: $mqtt_ssl
 hostname: $hostname
 mqtt_topic: $mqtt_topic
 EOF
-    
+
     print_success "MQTT configuration saved to mac2mqtt.yaml"
 }
 
 # Function to install optional dependencies
 install_optional_deps() {
     print_status "Checking optional dependencies..."
-    
+
     # Check for BetterDisplay CLI
     if ! command_exists betterdisplay; then
         print_warning "BetterDisplay CLI not found. This is required for display brightness control."
@@ -161,7 +161,7 @@ install_optional_deps() {
     else
         print_success "BetterDisplay CLI is available"
     fi
-    
+
     # Check for Media Control
     if ! command_exists media-control; then
         print_warning "Media Control not found. This is required for media player information."
@@ -181,21 +181,31 @@ install_optional_deps() {
     else
         print_success "Media Control is available"
     fi
+
+    # Check for LM Studio CLI
+    if [ -x "$HOME/.lmstudio/bin/lms" ]; then
+        print_success "LM Studio CLI is available"
+    else
+        print_warning "LM Studio CLI not found. This is required for AI model control."
+        print_status "To install LM Studio:"
+        print_status "  1. Download from https://lmstudio.ai/download"
+        print_status "  2. Run LM Studio at least once to install CLI tools"
+        print_status "  3. The CLI will be automatically available at ~/.lmstudio/bin/lms"
+    fi
 }
 
 # Function to create installation directory
 create_install_dir() {
-    local user=$(get_current_user)
-    local install_dir="/Users/$user/mac2mqtt"
-    
+    local install_dir="$HOME/mac2mqtt"
+
     print_status "Creating installation directory: $install_dir"
-    
+
     mkdir -p "$install_dir"
-    
+
     # Copy files to installation directory
     cp mac2mqtt "$install_dir/"
     cp mac2mqtt.yaml "$install_dir/"
-    
+
     # Copy management scripts if they exist
     if [ -f "restart.sh" ]; then
         cp restart.sh "$install_dir/"
@@ -205,45 +215,89 @@ create_install_dir() {
         cp debug.sh "$install_dir/"
         chmod +x "$install_dir/debug.sh"
     fi
-    
+
     print_success "Files copied to installation directory"
 }
 
 # Function to setup launch agent
 setup_launch_agent() {
     local user=$(get_current_user)
-    local install_dir="/Users/$user/mac2mqtt"
-    
+    local install_dir="$HOME/mac2mqtt"
+    local node_path=$(command -v node 2>/dev/null | xargs dirname 2>/dev/null || echo "")
+    local lms_path="$HOME/.lmstudio/bin"
+
     print_status "Setting up launch agent..."
-    
-    # Create plist file with correct username
-    sed "s/USERNAME/$user/g" com.hagak.mac2mqtt.plist > "/tmp/com.hagak.mac2mqtt.plist"
-    
-    # Create user's LaunchAgents directory if it doesn't exist
-    mkdir -p "/Users/$user/Library/LaunchAgents"
-    
-    # Copy to user's LaunchAgents directory (no root required)
-    cp "/tmp/com.hagak.mac2mqtt.plist" "/Users/$user/Library/LaunchAgents/"
-    
-    # Set proper permissions
-    chmod 644 "/Users/$user/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
-    
+
+    # Build PATH environment variable
+    local path_value="$lms_path"
+    if [ -n "$node_path" ]; then
+        path_value="$path_value:$node_path"
+    fi
+    path_value="$path_value:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # Create plist file with correct paths
+    cat > "/tmp/com.hagak.mac2mqtt.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>com.hagak.mac2mqtt</string>
+        <key>Program</key>
+        <string>$HOME/mac2mqtt/mac2mqtt</string>
+        <key>WorkingDirectory</key>
+        <string>$HOME/mac2mqtt/</string>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardErrorPath</key>
+        <string>/tmp/mac2mqtt.job.err</string>
+        <key>StandardOutPath</key>
+        <string>/tmp/mac2mqtt.job.out</string>
+        <key>EnvironmentVariables</key>
+        <dict>
+            <key>PATH</key>
+            <string>$path_value</string>
+            <key>HOME</key>
+            <string>$HOME</string>
+            <key>USER</key>
+            <string>$user</string>
+            <key>LOGNAME</key>
+            <string>$user</string>
+            <key>SHELL</key>
+            <string>/bin/zsh</string>
+        </dict>
+        <key>ProcessType</key>
+        <string>Background</string>
+        <key>ThrottleInterval</key>
+        <integer>10</integer>
+    </dict>
+</plist>
+EOF
+
+    # Copy to system LaunchAgents (requires sudo)
+    print_status "Installing launch agent (requires sudo)..."
+    sudo cp "/tmp/com.hagak.mac2mqtt.plist" "/Library/LaunchAgents/"
+    sudo chown root:wheel "/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
+    sudo chmod 644 "/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
+
     # Load the launch agent
-    launchctl load "/Users/$user/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
-    
+    sudo launchctl bootstrap gui/$(id -u) "/Library/LaunchAgents/com.hagak.mac2mqtt.plist" 2>/dev/null || \
+        print_warning "Service may already be loaded"
+
     # Clean up temp file
     rm "/tmp/com.hagak.mac2mqtt.plist"
-    
+
     print_success "Launch agent installed and loaded"
 }
 
 # Function to create management scripts
 create_management_scripts() {
-    local user=$(get_current_user)
-    local install_dir="/Users/$user/mac2mqtt"
-    
+    local install_dir="$HOME/mac2mqtt"
+
     print_status "Creating management scripts..."
-    
+
     # Status script
     cat > "$install_dir/status.sh" << 'EOF'
 #!/bin/bash
@@ -352,7 +406,7 @@ print_error() {
 
 # Stop service
 print_status "Stopping Mac2MQTT service..."
-launchctl unload "/Users/$(whoami)/Library/LaunchAgents/com.hagak.mac2mqtt.plist" 2>/dev/null || true
+sudo launchctl bootout gui/$(id -u)/com.hagak.mac2mqtt 2>/dev/null || true
 
 # Get current configuration
 if [ -f "mac2mqtt.yaml" ]; then
@@ -404,7 +458,7 @@ print_success "Configuration updated"
 
 # Restart service
 print_status "Restarting Mac2MQTT service..."
-launchctl load "/Users/$(whoami)/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
+sudo launchctl bootstrap gui/$(id -u) "/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
 
 print_success "Configuration complete!"
 EOF
@@ -450,15 +504,15 @@ fi
 
 # Stop and unload service
 print_status "Stopping Mac2MQTT service..."
-launchctl unload "/Users/$(whoami)/Library/LaunchAgents/com.hagak.mac2mqtt.plist" 2>/dev/null || true
+sudo launchctl bootout gui/$(id -u)/com.hagak.mac2mqtt 2>/dev/null || true
 
 # Remove launch agent
 print_status "Removing launch agent..."
-rm -f "/Users/$(whoami)/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
+sudo rm -f "/Library/LaunchAgents/com.hagak.mac2mqtt.plist"
 
 # Remove installation directory
 print_status "Removing installation files..."
-rm -rf "/Users/$(whoami)/mac2mqtt"
+rm -rf "$HOME/mac2mqtt"
 
 # Remove log files
 print_status "Cleaning up log files..."
@@ -469,24 +523,24 @@ EOF
 
     # Make scripts executable
     chmod +x "$install_dir"/*.sh
-    
+
     print_success "Management scripts created"
 }
 
 # Function to test installation
 test_installation() {
     print_status "Testing installation..."
-    
+
     # Wait a moment for service to start
     sleep 2
-    
+
     # Check if service is running
     if launchctl list | grep -q "com.hagak.mac2mqtt"; then
         print_success "Mac2MQTT service is running"
     else
         print_warning "Mac2MQTT service may not be running. Check logs with: ./status.sh"
     fi
-    
+
     # Check if log files exist
     if [ -f "/tmp/mac2mqtt.job.out" ]; then
         print_success "Log files are being created"
@@ -497,9 +551,8 @@ test_installation() {
 
 # Function to show post-install instructions
 show_post_install() {
-    local user=$(get_current_user)
-    local install_dir="/Users/$user/mac2mqtt"
-    
+    local install_dir="$HOME/mac2mqtt"
+
     echo ""
     echo "=========================================="
     echo "Mac2MQTT Installation Complete!"
@@ -536,12 +589,12 @@ main() {
     echo "Mac2MQTT Installer"
     echo "=========================================="
     echo ""
-    
+
     # Pre-installation checks
     check_root
     check_macos
     check_go
-    
+
     # Installation steps
     build_application
     configure_mqtt
@@ -551,9 +604,9 @@ main() {
     create_management_scripts
     test_installation
     show_post_install
-    
+
     print_success "Installation completed successfully!"
 }
 
 # Run main function
-main "$@" 
+main "$@"
