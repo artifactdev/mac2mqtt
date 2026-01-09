@@ -49,18 +49,18 @@ func TestGetWorkingDirectory(t *testing.T) {
 }
 
 func TestGetMuteStatus(t *testing.T) {
-    _ = getMuteStatus() // Kann true/false sein, Test auf Fehlerfreiheit
+    _ = macos.GetMuteStatus() // Kann true/false sein, Test auf Fehlerfreiheit
 }
 
 func TestGetCurrentVolume(t *testing.T) {
-    vol := getCurrentVolume()
+    vol := macos.GetVolume()
     if vol < 0 || vol > 100 {
         t.Errorf("Volume außerhalb des Bereichs: %d", vol)
     }
 }
 
 func TestGetDiskUsage(t *testing.T) {
-    disk, err := getDiskUsage()
+    disk, err := macos.GetDiskUsage()
     if err != nil {
         t.Errorf("Fehler bei getDiskUsage: %v", err)
     }
@@ -70,7 +70,7 @@ func TestGetDiskUsage(t *testing.T) {
 }
 
 func TestGetMemoryUsage(t *testing.T) {
-    mem, err := getMemoryUsage()
+    mem, err := macos.GetMemoryUsage()
     if err != nil {
         t.Errorf("Fehler bei getMemoryUsage: %v", err)
     }
@@ -80,7 +80,7 @@ func TestGetMemoryUsage(t *testing.T) {
 }
 
 func TestGetSystemUptime(t *testing.T) {
-    uptime, err := getSystemUptime()
+    uptime, err := macos.GetSystemUptime()
     if err != nil {
         t.Errorf("Fehler bei getSystemUptime: %v", err)
     }

@@ -3,13 +3,10 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,14 +18,10 @@ import (
 
 	"bessarabov/mac2mqtt/macos"
 
-	"github.com/shirou/gopsutil/v3/mem" // Using v3 for current versions
 	"gopkg.in/yaml.v2"
 
 	sigar "github.com/cloudfoundry/gosigar"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-
-	// Using my fork until #9 is resolved ( https://github.com/antonfisher/go-media-devices-state/pull/9 )
-	mediadevices "github.com/antonfisher/go-media-devices-state"
 )
 
 func init() {
@@ -63,18 +56,6 @@ type MediaControlError struct {
 
 func (e *MediaControlError) Error() string {
 	return e.message
-}
-
-// isBetterDisplayCLIAvailable checks if BetterDisplay CLI is installed and accessible
-func isBetterDisplayCLIAvailable() bool {
-	_, err := exec.LookPath("betterdisplaycli")
-	return err == nil
-}
-
-// isMediaControlAvailable checks if Media Control is installed and accessible
-func isMediaControlAvailable() bool {
-	_, err := exec.LookPath("media-control")
-	return err == nil
 }
 
 // Type aliases for convenience
@@ -230,384 +211,9 @@ func (app *Application) getTopicPrefix() string {
 
 
 
-func getCommandOutput(name string, arg ...string) string {
-	cmd := exec.Command(name, arg...)
-	stdout, err := cmd.Output()
-	if err != nil {
-		log.Println("error: " + err.Error())
-		log.Println("output: " + string(stdout))
-		log.Fatal(err)
-	}
-	stdoutStr := string(stdout)
-	stdoutStr = strings.TrimSuffix(stdoutStr, "\n")
-
-	return stdoutStr
-}
-
-func getCaffeinateStatus() bool {
-	cmd := "/bin/ps ax | /usr/bin/grep caffeinate | /usr/bin/grep -v grep"
-	output, err := exec.Command("/bin/sh", "-c", cmd).Output()
-	//revive:disable-next-line
-	if err != nil {
-		//log.Fatal(err)
-	}
-	stdoutStr := string(output)
-	stdoutStr = strings.TrimSuffix(stdoutStr, "\n")
-	return stdoutStr != ""
-}
-
-func getMuteStatus() bool {
-	log.Println("Getting mute status")
-	output := getCommandOutput("/usr/bin/osascript", "-e", "output muted of (get volume settings)")
-	b, err := strconv.ParseBool(output)
-	//revive:disable-next-line
-	if err != nil {
-		// Continue to fallback method
-	}
-	if output == "missing value" {
-		currentsource := getCommandOutput("/opt/homebrew/bin/switchaudiosource", "-c")
-		var resp *http.Response
-		var err error
-
-		// URL encode the current source name to handle spaces and special characters
-		encodedSource := strings.ReplaceAll(currentsource, " ", "%20")
-		url := fmt.Sprintf("http://localhost:55777/get?name=%s&mute", encodedSource)
-		resp, err = http.Get(url)
-		if err != nil {
-			log.Printf("Error getting mute status for %s: %v", currentsource, err)
-			return false
-		}
-		if resp != nil {
-			defer resp.Body.Close()
-			output, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Error getting mute status body for %s: %v", currentsource, err)
-				return false
-			}
-			output = []byte(strings.TrimSuffix(string(output), "\n"))
-			mute := string(output)
-			log.Println("Mute Output: " + mute)
-			b = mute == "on"
-		}
-	}
-	return b
-}
-
-func getCurrentVolume() int {
-	log.Println("Getting volume status")
-	output := getCommandOutput("/usr/bin/osascript", "-e", "output volume of (get volume settings)")
-	output = strings.TrimSuffix(output, "\n")
-	i, err := strconv.Atoi(output)
-	if err != nil {
-		currentsource := getCommandOutput("/opt/homebrew/bin/switchaudiosource", "-c")
-		var resp *http.Response
-		var err error
-		// URL encode the current source name to handle spaces and special characters
-		encodedSource := strings.ReplaceAll(currentsource, " ", "%20")
-		url := fmt.Sprintf("http://localhost:55777/get?name=%s&volume", encodedSource)
-		resp, err = http.Get(url)
-		if err != nil {
-			log.Printf("Error getting volume status for %s: %v", currentsource, err)
-			return 0
-		}
-		if resp != nil {
-			defer resp.Body.Close()
-			output, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("Error getting volume status body for %s: %v", currentsource, err)
-				return 0
-			}
-			output = []byte(strings.TrimSuffix(string(output), "\n"))
-			outputStr := string(output)
-			log.Println("Vol Output: " + outputStr)
-			f, err := strconv.ParseFloat(outputStr, 64)
-			if err != nil {
-				log.Printf("Error parsing volume value for %s: %v", currentsource, err)
-				return 0
-			}
-			i = int(f * 100)
-		}
-	}
-	return i
-}
-
-func runCommand(name string, arg ...string) {
-	cmd := exec.Command(name, arg...)
-
-	_, err := cmd.Output()
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// from 0 to 100
-func setVolume(i int) {
-	//Test first if we can control the mute if not use betterdisplaycli
-	test := getCommandOutput("/usr/bin/osascript", "-e", "output volume of (get volume settings)")
-	if test == "missing value" {
-		volumef := float64(i) / 100
-		currentsource := getCommandOutput("/opt/homebrew/bin/switchaudiosource", "-c")
-		// URL encode the current source name to handle spaces and special characters
-		encodedSource := strings.ReplaceAll(currentsource, " ", "%20")
-		url := fmt.Sprintf("http://localhost:55777/set?name=%s&volume=%f", encodedSource, volumef)
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("Error setting volume for %s: %v", currentsource, err)
-		} else if resp != nil {
-			resp.Body.Close()
-		}
-	} else {
-		runCommand("/usr/bin/osascript", "-e", "set volume output volume "+strconv.Itoa(i))
-	}
-}
-
-// true - turn mute on
-// false - turn mute off
-func setMute(b bool) {
-	//Test first if we can control the mute if not use betterdisplaycli
-	test := getCommandOutput("/usr/bin/osascript", "-e", "output volume of (get volume settings)")
-	if test == "missing value" {
-		state := "off"
-		if b {
-			state = "on"
-		}
-		currentsource := getCommandOutput("/opt/homebrew/bin/switchaudiosource", "-c")
-		// URL encode the current source name to handle spaces and special characters
-		encodedSource := strings.ReplaceAll(currentsource, " ", "%20")
-		url := fmt.Sprintf("http://localhost:55777/set?name=%s&mute=%s", encodedSource, state)
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("Error setting mute for %s: %v", currentsource, err)
-		} else if resp != nil {
-			resp.Body.Close()
-		}
-	} else {
-		runCommand("/usr/bin/osascript", "-e", "set volume output muted "+strconv.FormatBool(b))
-	}
-
-}
-
-func commandSleep() {
-	macos.Sleep()
-}
-
-func commandDisplaySleep() {
-	macos.DisplaySleep()
-}
-
-func commandShutdown() {
-
-	if os.Getuid() == 0 {
-		// if the program is run by root user we are doing the most powerfull shutdown - that always shuts down the computer
-		runCommand("shutdown", "-h", "now")
-	} else {
-		// if the program is run by ordinary user we are trying to shutdown, but it may fail if the other user is logged in
-		runCommand("/usr/bin/osascript", "-e", "tell app \"System Events\" to shut down")
-	}
-
-}
-
-func commandDisplayWake() {
-	macos.DisplayWake()
-}
-
-func commandKeepAwake() {
-	cmd := "/usr/bin/caffeinate -d &"
-	err := exec.Command("/bin/sh", "-c", cmd).Start()
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func commandAllowSleep() {
-	cmd := "/bin/ps ax | /usr/bin/grep caffeinate | /usr/bin/grep -v grep | /usr/bin/awk '{print \"kill \"$1}'|sh"
-	_, err := exec.Command("/bin/sh", "-c", cmd).Output()
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func commandRunShortcut(shortcut string) {
-	macos.RunShortcut(shortcut)
-}
-
-func commandScreensaver() {
-	macos.Screensaver()
-}
-
-func commandPlayPause() {
-	macos.PlayPause()
-}
-
-// getDisplays retrieves all available displays using BetterDisplay CLI
-func getDisplays() []Display {
-
-	// Check if BetterDisplay CLI is available
-	if !isBetterDisplayCLIAvailable() {
-		log.Println("BetterDisplay CLI is not installed or not accessible")
-		log.Println("To install BetterDisplay CLI:")
-		log.Println("  1. Install BetterDisplay from https://github.com/waydabber/BetterDisplay")
-		log.Println("  2. Enable CLI access in BetterDisplay preferences")
-		log.Println("  3. Restart the application")
-		log.Println("Display brightness controls will be disabled until BetterDisplay CLI is available")
-		return nil
-	}
-
-	log.Println("Executing: betterdisplaycli get -identifiers")
-	out, err := exec.Command("betterdisplaycli", "get", "-identifiers").Output()
-	if err != nil {
-		log.Printf("Error getting displays: %v", err)
-		log.Println("BetterDisplay CLI is installed but failed to execute")
-		log.Println("Make sure BetterDisplay is running and CLI access is enabled")
-		return nil
-	}
-
-	log.Printf("BetterDisplay CLI output: %s", string(out))
-
-	// BetterDisplay CLI returns comma-separated JSON objects, not an array
-	// We need to wrap it in brackets to make it a valid JSON array
-	jsonStr := "[" + string(out) + "]"
-
-	var displays []Display
-	err = json.Unmarshal([]byte(jsonStr), &displays)
-	if err != nil {
-		log.Printf("Error parsing display JSON: %v", err)
-		log.Println("BetterDisplay CLI returned invalid JSON format")
-		return nil
-	}
-
-	return displays
-}
-
-// isDisplayAvailable checks if a display is currently available
-func isDisplayAvailable(displayID string) bool {
-	// Get current display list to check if display is available
-	displays := getDisplays()
-	if displays == nil {
-		return false
-	}
-
-	for _, display := range displays {
-		if display.DisplayID == displayID {
-			return true
-		}
-	}
-	return false
-}
-
-// getDisplayBrightness gets the current brightness for a specific display
-func getDisplayBrightness(displayID string) (int, error) {
-	// First check if display is available to avoid unnecessary errors
-	if !isDisplayAvailable(displayID) {
-		return 0, fmt.Errorf("display %s is not currently available", displayID)
-	}
-
-	out, err := exec.Command("betterdisplaycli", "get", "-displayID="+displayID, "-brightness", "-value").Output()
-	if err != nil {
-		return 0, fmt.Errorf("error getting brightness for display %s: %v", displayID, err)
-	}
-
-	// Parse the brightness value (0.0-1.0) and convert to percentage
-	brightnessStr := strings.TrimSpace(string(out))
-	brightness, err := strconv.ParseFloat(brightnessStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("error parsing brightness value: %v", err)
-	}
-
-	return int(brightness * 100), nil
-}
-
-// setDisplayBrightness sets the brightness for a specific display
-func setDisplayBrightness(displayID string, brightness int) error {
-	cmd := exec.Command("betterdisplaycli", "set", "-displayID="+displayID, "-brightness="+strconv.Itoa(brightness)+"%")
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("error setting brightness for display %s: %v", displayID, err)
-	}
-	return nil
-}
-
-// getMediaInfo retrieves current media information using Media Control
-func getMediaInfo() (*MediaInfo, error) {
-	// Check if Media Control is available
-	if !isMediaControlAvailable() {
-		return nil, &MediaControlError{message: "Media Control is not installed or not accessible"}
-	}
-
-	// Get media information in JSON format
-	out, err := exec.Command("media-control", "get").Output()
-	if err != nil {
-		return nil, fmt.Errorf("error getting media info: %v", err)
-	}
-
-	// Parse JSON output
-	var mediaData map[string]interface{}
-	if err := json.Unmarshal(out, &mediaData); err != nil {
-		return nil, fmt.Errorf("error parsing media-control JSON output: %v", err)
-	}
-
-	// Check if media is playing
-	playing, ok := mediaData["playing"].(bool)
-	if !ok || !playing {
-		return nil, nil // No media playing
-	}
-
-	// Extract media information
-	mediaInfo := &MediaInfo{}
-
-	// Get title
-	if title, ok := mediaData["title"].(string); ok && title != "" {
-		mediaInfo.Title = title
-	}
-
-	// Get artist
-	if artist, ok := mediaData["artist"].(string); ok && artist != "" {
-		mediaInfo.Artist = artist
-	}
-
-	// Get album
-	if album, ok := mediaData["album"].(string); ok && album != "" {
-		mediaInfo.Album = album
-	}
-
-	// Get app name
-	if appName, ok := mediaData["appName"].(string); ok && appName != "" {
-		mediaInfo.AppName = appName
-	}
-
-	// Get duration (in seconds)
-	duration := 0
-	if d, ok := mediaData["duration"].(float64); ok {
-		duration = int(d)
-	} else if d, ok := mediaData["durationMicros"].(float64); ok {
-		duration = int(d / 1000000)
-	} else if d, ok := mediaData["totalTime"].(float64); ok {
-		duration = int(d)
-	} else if d, ok := mediaData["totalDuration"].(float64); ok {
-		duration = int(d)
-	}
-	mediaInfo.Duration = duration
-
-	// Get position (in seconds)
-	position := 0
-	if p, ok := mediaData["elapsedTime"].(float64); ok {
-		position = int(p)
-	} else if p, ok := mediaData["position"].(float64); ok {
-		position = int(p)
-	} else if p, ok := mediaData["positionMicros"].(float64); ok {
-		position = int(p / 1000000)
-	}
-	mediaInfo.Position = position
-
-	// Set state based on playing status
-	mediaInfo.State = "playing"
-
-	return mediaInfo, nil
-}
-
 // updateMediaPlayer updates the MQTT topics with current media player information
 func (app *Application) updateMediaPlayer(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := macos.GetMediaInfo()
 	if err != nil {
 		// Check if it's a Media Control error
 		if _, ok := err.(*MediaControlError); ok {
@@ -646,7 +252,7 @@ func (app *Application) updateMediaPlayer(client mqtt.Client) {
 
 // updateNowPlaying updates the now playing sensor with current media information
 func (app *Application) updateNowPlaying(client mqtt.Client) {
-	mediaInfo, err := getMediaInfo()
+	mediaInfo, err := macos.GetMediaInfo()
 	if err != nil {
 		if _, ok := err.(*MediaControlError); ok {
 			log.Printf("Media Control is not available: %v", err)
@@ -907,31 +513,6 @@ func (app *Application) resetActivityTimer(client mqtt.Client) {
 	})
 }
 
-// getSystemIdleTime gets the system idle time in seconds
-func getSystemIdleTime() (int, error) {
-	cmd := exec.Command("ioreg", "-c", "IOHIDSystem")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("error running ioreg: %w", err)
-	}
-
-	// Parse the HIDIdleTime from the output
-	re := regexp.MustCompile(`"HIDIdleTime" = (\d+)`)
-	matches := re.FindStringSubmatch(string(output))
-	if len(matches) < 2 {
-		return 0, fmt.Errorf("HIDIdleTime not found in ioreg output")
-	}
-
-	idleTimeNanos, err := strconv.ParseInt(matches[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("error parsing idle time: %w", err)
-	}
-
-	// Convert nanoseconds to seconds
-	idleTimeSeconds := int(idleTimeNanos / 1000000000)
-	return idleTimeSeconds, nil
-}
-
 // startUserActivityMonitoring starts monitoring user activity using system idle time
 func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 	log.Println("Starting user activity monitoring...")
@@ -952,7 +533,7 @@ func (app *Application) startUserActivityMonitoring(client mqtt.Client) {
 				continue
 			}
 
-			idleTime, err := getSystemIdleTime()
+			idleTime, err := macos.GetSystemIdleTime()
 			if err != nil {
 				log.Printf("Error getting system idle time: %v", err)
 				time.Sleep(2 * time.Second)
@@ -1231,7 +812,7 @@ func (app *Application) handleVolumeCommand(client mqtt.Client, topic, payload s
 		return true
 	}
 
-	setVolume(volume)
+	macos.SetVolume(volume)
 	app.updateVolume(client)
 	app.updateMute(client)
 	return true
@@ -1249,7 +830,7 @@ func (app *Application) handleMuteCommand(client mqtt.Client, topic, payload str
 		return true
 	}
 
-	setMute(mute)
+	macos.SetMute(mute)
 	app.updateVolume(client)
 	app.updateMute(client)
 	return true
@@ -1263,15 +844,15 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 
 	switch payload {
 	case "sleep":
-		commandSleep()
+		macos.Sleep()
 	case "displaysleep":
-		commandDisplaySleep()
+		macos.DisplaySleep()
 	case "displaywake":
-		commandDisplayWake()
+		macos.DisplayWake()
 	case "shutdown":
-		commandShutdown()
+		macos.Shutdown()
 	case "screensaver":
-		commandScreensaver()
+		macos.Screensaver()
 	default:
 		log.Printf("Unknown system command: %s", payload)
 	}
@@ -1297,11 +878,11 @@ func (app *Application) handleDisplayBrightnessCommand(client mqtt.Client, topic
 				return true
 			}
 
-			err = setDisplayBrightness(display.DisplayID, brightness)
+			err = macos.SetDisplayBrightness(display.DisplayID, brightness)
 			if err != nil {
 				log.Printf("Error setting brightness for display %s: %v", display.Name, err)
 				// Check if it's a BetterDisplay CLI error
-				if !isBetterDisplayCLIAvailable() {
+				if !macos.IsBetterDisplayCLIAvailable() {
 					log.Println("BetterDisplay CLI is not available. Please install BetterDisplay and enable CLI access.")
 				}
 			} else {
@@ -1326,7 +907,7 @@ func (app *Application) handleShortcutCommand(topic, payload string) bool {
 		return true
 	}
 
-	commandRunShortcut(payload)
+	macos.RunShortcut(payload)
 	return true
 }
 
@@ -1343,9 +924,9 @@ func (app *Application) handleKeepAwakeCommand(client mqtt.Client, topic, payloa
 	}
 
 	if keepAwake {
-		commandKeepAwake()
+		macos.KeepAwake()
 	} else {
-		commandAllowSleep()
+		macos.AllowSleep()
 	}
 	app.updateCaffeinateStatus(client)
 	return true
@@ -1358,7 +939,7 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 	}
 
 	if payload == "playpause" {
-		commandPlayPause()
+		macos.PlayPause()
 		// Update the now playing sensor after a short delay to reflect the new state
 		time.Sleep(500 * time.Millisecond)
 		app.updateNowPlaying(client)
@@ -1367,101 +948,20 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 }
 
 func (app *Application) updateVolume(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(getCurrentVolume()))
+	token := client.Publish(app.getTopicPrefix()+"/status/volume", 0, false, strconv.Itoa(macos.GetVolume()))
 	token.Wait()
 }
 
 func (app *Application) updateMute(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(getMuteStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/mute", 0, false, strconv.FormatBool(macos.GetMuteStatus()))
 	token.Wait()
 }
 
-func getBatteryChargePercent() string {
-
-	output := getCommandOutput("/usr/bin/pmset", "-g", "batt")
-
-	// $ /usr/bin/pmset -g batt
-	// Now drawing from 'Battery Power'
-	//  -InternalBattery-0 (id=4653155)        100%; discharging; 20:00 remaining present: true
-
-	r := regexp.MustCompile(`(\d+)%`)
-	res := r.FindStringSubmatch(output)
-	if len(res) == 0 {
-		return ""
-	}
-
-	return res[1]
-}
-
 // DiskUsage holds disk usage statistics
-type DiskUsage struct {
-	Total       uint64  `json:"total"`        // Total bytes
-	Used        uint64  `json:"used"`         // Used bytes
-	Free        uint64  `json:"free"`         // Free bytes
-	UsedPercent float64 `json:"used_percent"` // Used percentage
-	FreePercent float64 `json:"free_percent"` // Free percentage
-}
-
-func getDiskUsage() (*DiskUsage, error) {
-	fs := sigar.FileSystemList{}
-	if err := fs.Get(); err != nil {
-		return nil, fmt.Errorf("failed to get filesystem list: %w", err)
-	}
-
-	// Find the root filesystem
-	for _, filesystem := range fs.List {
-		if filesystem.DirName == "/" {
-			usage := sigar.FileSystemUsage{}
-			if err := usage.Get(filesystem.DirName); err != nil {
-				return nil, fmt.Errorf("failed to get disk usage: %w", err)
-			}
-
-			// Convert from KB to bytes (gosigar returns values in KB)
-			totalBytes := usage.Total * 1024
-			usedBytes := usage.Used * 1024
-			freeBytes := usage.Free * 1024
-
-			// Calculate percentages
-			usedPercent := float64(0)
-			freePercent := float64(0)
-			if totalBytes > 0 {
-				usedPercent = float64(usedBytes) / float64(totalBytes) * 100
-				freePercent = float64(freeBytes) / float64(totalBytes) * 100
-			}
-
-			return &DiskUsage{
-				Total:       totalBytes,
-				Used:        usedBytes,
-				Free:        freeBytes,
-				UsedPercent: usedPercent,
-				FreePercent: freePercent,
-			}, nil
-		}
-	}
-
-	return nil, fmt.Errorf("root filesystem not found")
-}
-
-// CPUUsage holds CPU usage statistics
-type CPUUsage struct {
-	UsedPercent float64 `json:"used_percent"` // CPU used percentage
-	FreePercent float64 `json:"free_percent"` // CPU idle/free percentage
-}
-
-// MemoryUsage holds memory usage statistics
-type MemoryUsage struct {
-	Total       uint64  `json:"total"`        // Total bytes
-	Used        uint64  `json:"used"`         // Used bytes
-	Free        uint64  `json:"free"`         // Free bytes
-	UsedPercent float64 `json:"used_percent"` // Used percentage
-	FreePercent float64 `json:"free_percent"` // Free percentage
-}
-
-// UptimeInfo holds system uptime information
-type UptimeInfo struct {
-	Seconds uint64 `json:"seconds"` // Uptime in seconds
-	Human   string `json:"human"`   // Human-readable format
-}
+type DiskUsage = macos.DiskUsage
+type CPUUsage = macos.CPUUsage
+type MemoryUsage = macos.MemoryUsage
+type UptimeInfo = macos.UptimeInfo
 
 func (app *Application) getCPUUsage() (*CPUUsage, error) {
 	cpu := sigar.Cpu{}
@@ -1506,62 +1006,18 @@ func (app *Application) getCPUUsage() (*CPUUsage, error) {
 	}, nil
 }
 
-func getMemoryUsage() (*MemoryUsage, error) {
-	vmStat, err := mem.VirtualMemory()
-	if err != nil {
-		log.Fatalf("Error getting virtual memory stats: %v", err)
-	}
-
-	total := vmStat.Total
-	used := vmStat.Used
-	free := vmStat.Free
-
-	return &MemoryUsage{
-		Total:       total,
-		Used:        used,
-		Free:        free,
-		UsedPercent: vmStat.UsedPercent,
-		FreePercent: 100 - vmStat.UsedPercent,
-	}, nil
-}
-
-func getSystemUptime() (*UptimeInfo, error) {
-	uptime := sigar.Uptime{}
-	if err := uptime.Get(); err != nil {
-		return nil, fmt.Errorf("failed to get uptime: %w", err)
-	}
-
-	// Convert to human-readable format
-	totalSeconds := uint64(uptime.Length)
-	days := totalSeconds / 86400
-	hours := (totalSeconds % 86400) / 3600
-	minutes := (totalSeconds % 3600) / 60
-
-	var uptimeHuman string
-	if days > 0 {
-		uptimeHuman = fmt.Sprintf("%d days, %d:%02d", days, hours, minutes)
-	} else {
-		uptimeHuman = fmt.Sprintf("%d:%02d", hours, minutes)
-	}
-
-	return &UptimeInfo{
-		Seconds: totalSeconds,
-		Human:   uptimeHuman,
-	}, nil
-}
-
 func (app *Application) updateBattery(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/battery", 0, false, getBatteryChargePercent())
+	token := client.Publish(app.getTopicPrefix()+"/status/battery", 0, false, macos.GetBatteryChargePercent())
 	token.Wait()
 }
 
 func (app *Application) updateCaffeinateStatus(client mqtt.Client) {
-	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(getCaffeinateStatus()))
+	token := client.Publish(app.getTopicPrefix()+"/status/caffeinate", 0, false, strconv.FormatBool(macos.GetCaffeinateStatus()))
 	token.Wait()
 }
 
 func (app *Application) updateDiskUsage(client mqtt.Client) {
-	diskUsage, err := getDiskUsage()
+	diskUsage, err := macos.GetDiskUsage()
 	if err != nil {
 		log.Printf("Failed to get disk usage: %v", err)
 		return
@@ -1588,7 +1044,7 @@ func (app *Application) updateCPUUsage(client mqtt.Client) {
 }
 
 func (app *Application) updateMemoryUsage(client mqtt.Client) {
-	memUsage, err := getMemoryUsage()
+	memUsage, err := macos.GetMemoryUsage()
 	if err != nil {
 		log.Printf("Failed to get memory usage: %v", err)
 		return
@@ -1603,7 +1059,7 @@ func (app *Application) updateMemoryUsage(client mqtt.Client) {
 }
 
 func (app *Application) updateUptime(client mqtt.Client) {
-	uptime, err := getSystemUptime()
+	uptime, err := macos.GetSystemUptime()
 	if err != nil {
 		log.Printf("Failed to get uptime: %v", err)
 		return
@@ -1614,22 +1070,8 @@ func (app *Application) updateUptime(client mqtt.Client) {
 	client.Publish(app.getTopicPrefix()+"/status/uptime/human", 0, false, uptime.Human)
 }
 
-func getMediaDevicesState() (bool, bool, error) {
-	isMicOn, err := mediadevices.IsMicrophoneOn()
-	if err != nil {
-		return false, false, fmt.Errorf("failed to get microphone state: %w", err)
-	}
-
-	isCameraOn, err := mediadevices.IsCameraOn()
-	if err != nil {
-		return isMicOn, false, fmt.Errorf("failed to get camera state: %w", err)
-	}
-
-	return isMicOn, isCameraOn, nil
-}
-
 func (app *Application) updateMediaDevices(client mqtt.Client) {
-	isMicOn, isCameraOn, err := getMediaDevicesState()
+	isMicOn, isCameraOn, err := macos.GetMediaDevicesState()
 	if err != nil {
 		log.Printf("Failed to get media devices state: %v", err)
 		// Publish "unknown" state on error
@@ -1652,37 +1094,8 @@ func (app *Application) updateMediaDevices(client mqtt.Client) {
 	client.Publish(app.getTopicPrefix()+"/status/camera", 0, false, cameraState)
 }
 
-func getPublicIP() (string, error) {
-	// Use DNS over HTTPS to query Cloudflare's whoami service
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: 5 * time.Second,
-			}
-			return d.DialContext(ctx, "udp", "ns1.google.com:53")
-
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Query TXT record from Cloudflare's whoami service
-	txtRecords, err := resolver.LookupTXT(ctx, "o-o.myaddr.l.google.com")
-	if err != nil {
-		return "", fmt.Errorf("failed to lookup public IP via DNS: %w", err)
-	}
-
-	if len(txtRecords) > 0 {
-		return txtRecords[0], nil
-	}
-
-	return "", fmt.Errorf("no IP address found in DNS response")
-}
-
 func (app *Application) updatePublicIP(client mqtt.Client) {
-	publicIP, err := getPublicIP()
+	publicIP, err := macos.GetPublicIP()
 	if err != nil {
 		log.Printf("Failed to get public IP: %v", err)
 		// Publish empty string on error
@@ -2017,7 +1430,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 	components["idle_time_seconds"] = idleTime
 
 	// Add media control components if Media Control is available
-	if isMediaControlAvailable() {
+	if macos.IsMediaControlAvailable() {
 		playPause := map[string]interface{}{
 			"p":             "button",
 			"name":          "Play/Pause",
@@ -2117,7 +1530,7 @@ func (app *Application) Run() error {
 
 	// Check Media Control availability
 	log.Println("=== CHECKING MEDIA CONTROL ===")
-	if isMediaControlAvailable() {
+	if macos.IsMediaControlAvailable() {
 		log.Println("Media Control is available - Media player will be enabled")
 	} else {
 		log.Println("Media Control is not installed or not accessible")
