@@ -54,10 +54,10 @@ type TemperatureInfo struct {
 
 // NetworkStats holds network statistics
 type NetworkStats struct {
-	BytesRecv   uint64  `json:"bytes_recv"`   // Total bytes received
-	BytesSent   uint64  `json:"bytes_sent"`   // Total bytes sent
-	DownloadMbps float64 `json:"download_mbps"` // Download speed in Mbps
-	UploadMbps   float64 `json:"upload_mbps"`   // Upload speed in Mbps
+	BytesRecv    uint64  `json:"bytes_recv"`    // Total bytes received
+	BytesSent    uint64  `json:"bytes_sent"`    // Total bytes sent
+	DownloadMBps float64 `json:"download_mbps"` // Download speed in MB/s
+	UploadMBps   float64 `json:"upload_mbps"`   // Upload speed in MB/s
 }
 
 // GetDiskUsage returns disk usage statistics for the root filesystem
@@ -343,7 +343,13 @@ func GetGPUTemperature() (float64, error) {
 
 // GetTemperatures returns CPU and GPU temperatures
 func GetTemperatures() (*TemperatureInfo, error) {
-	// Use alternative method without sudo to avoid password prompts
+	// First try HID-based temperature reading (works on Apple Silicon without sudo)
+	tempInfo, hidErr := GetTemperaturesHID()
+	if hidErr == nil && (tempInfo.CPU > 0 || tempInfo.GPU > 0) {
+		return tempInfo, nil
+	}
+
+	// Fallback: Try alternative sysctl method (Intel Macs)
 	cpuTemp, cpuErr := getCPUTempAlternative()
 	if cpuErr != nil {
 		// Temperature monitoring not available on this system
@@ -356,7 +362,7 @@ func GetTemperatures() (*TemperatureInfo, error) {
 
 	return &TemperatureInfo{
 		CPU: cpuTemp,
-		GPU: 0, // GPU temperature requires sudo, set to 0
+		GPU: 0, // GPU temperature requires sudo on Intel Macs
 	}, nil
 }
 
@@ -396,29 +402,29 @@ func GetNetworkStats(lastStats *NetworkStats, interval time.Duration) (*NetworkS
 	}
 
 	// Calculate speeds if we have previous stats
-	var downloadMbps, uploadMbps float64
+	var downloadMBps, uploadMBps float64
 	if lastStats != nil && interval.Seconds() > 0 {
 		// Calculate bytes per second
 		bytesRecvDiff := float64(totalBytesRecv - lastStats.BytesRecv)
 		bytesSentDiff := float64(totalBytesSent - lastStats.BytesSent)
 
-		// Convert to Mbps (megabits per second)
-		downloadMbps = (bytesRecvDiff * 8) / (interval.Seconds() * 1000000)
-		uploadMbps = (bytesSentDiff * 8) / (interval.Seconds() * 1000000)
+		// Convert to MB/s (megabytes per second)
+		downloadMBps = bytesRecvDiff / (interval.Seconds() * 1000000)
+		uploadMBps = bytesSentDiff / (interval.Seconds() * 1000000)
 
 		// Ensure non-negative values
-		if downloadMbps < 0 {
-			downloadMbps = 0
+		if downloadMBps < 0 {
+			downloadMBps = 0
 		}
-		if uploadMbps < 0 {
-			uploadMbps = 0
+		if uploadMBps < 0 {
+			uploadMBps = 0
 		}
 	}
 
 	return &NetworkStats{
-		BytesRecv:   totalBytesRecv,
-		BytesSent:   totalBytesSent,
-		DownloadMbps: downloadMbps,
-		UploadMbps:   uploadMbps,
+		BytesRecv:    totalBytesRecv,
+		BytesSent:    totalBytesSent,
+		DownloadMBps: downloadMBps,
+		UploadMBps:   uploadMBps,
 	}, nil
 }

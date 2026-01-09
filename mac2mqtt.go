@@ -1329,8 +1329,8 @@ func (app *Application) updateNetworkStats(client mqtt.Client) {
 		return
 	}
 
-	log.Printf("Got network stats - Recv: %d bytes, Sent: %d bytes, Down: %.2f Mbps, Up: %.2f Mbps",
-		stats.BytesRecv, stats.BytesSent, stats.DownloadMbps, stats.UploadMbps)
+	log.Printf("Got network stats - Recv: %d bytes, Sent: %d bytes, Down: %.2f MB/s, Up: %.2f MB/s",
+		stats.BytesRecv, stats.BytesSent, stats.DownloadMBps, stats.UploadMBps)
 
 	// Update stored values
 	app.lastNetworkStats = stats
@@ -1339,8 +1339,8 @@ func (app *Application) updateNetworkStats(client mqtt.Client) {
 	// Publish network metrics
 	client.Publish(app.getTopicPrefix()+"/status/network/bytes_received", 0, false, fmt.Sprintf("%d", stats.BytesRecv))
 	client.Publish(app.getTopicPrefix()+"/status/network/bytes_sent", 0, false, fmt.Sprintf("%d", stats.BytesSent))
-	client.Publish(app.getTopicPrefix()+"/status/network/download_speed", 0, false, fmt.Sprintf("%.2f", stats.DownloadMbps))
-	client.Publish(app.getTopicPrefix()+"/status/network/upload_speed", 0, false, fmt.Sprintf("%.2f", stats.UploadMbps))
+	client.Publish(app.getTopicPrefix()+"/status/network/download_speed", 0, false, fmt.Sprintf("%.2f", stats.DownloadMBps))
+	client.Publish(app.getTopicPrefix()+"/status/network/upload_speed", 0, false, fmt.Sprintf("%.2f", stats.UploadMBps))
 	log.Printf("Published network stats to %s/status/network/*", app.getTopicPrefix())
 }
 
@@ -1697,7 +1697,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"name":                "Network Download Speed",
 		"unique_id":           app.hostname + "_network_download_speed",
 		"state_topic":         app.getTopicPrefix() + "/status/network/download_speed",
-		"unit_of_measurement": "Mbps",
+		"unit_of_measurement": "MB/s",
 		"device_class":        "data_rate",
 		"state_class":         "measurement",
 		"icon":                "mdi:download-network",
@@ -1708,7 +1708,7 @@ func (app *Application) setDevice(client mqtt.Client) {
 		"name":                "Network Upload Speed",
 		"unique_id":           app.hostname + "_network_upload_speed",
 		"state_topic":         app.getTopicPrefix() + "/status/network/upload_speed",
-		"unit_of_measurement": "Mbps",
+		"unit_of_measurement": "MB/s",
 		"device_class":        "data_rate",
 		"state_class":         "measurement",
 		"icon":                "mdi:upload-network",
