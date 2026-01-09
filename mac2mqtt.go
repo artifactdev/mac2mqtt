@@ -772,7 +772,7 @@ func (app *Application) getMQTTClientWithRetry(retryCount int) error {
 }
 
 func (app *Application) sub(client mqtt.Client, topic string) {
-	token := client.Subscribe(topic, 0, nil)
+	token := client.Subscribe(topic, 0, app.messagePubHandler)
 	token.Wait()
 	log.Printf("Subscribed to topic: %s\n", topic)
 }
@@ -780,6 +780,7 @@ func (app *Application) sub(client mqtt.Client, topic string) {
 func (app *Application) listen(client mqtt.Client, msg mqtt.Message) {
 	topic := msg.Topic()
 	payload := string(msg.Payload())
+	log.Printf("listen() called with topic: %s, payload: %s", topic, payload)
 
 	// Handle volume commands
 	if app.handleVolumeCommand(client, topic, payload) {
@@ -887,10 +888,7 @@ func (app *Application) handleSystemCommand(topic, payload string) bool {
 func (app *Application) handleDisplayBrightnessCommand(client mqtt.Client, topic, payload string) bool {
 	// Check if we have any displays available
 	if len(app.displays) == 0 {
-		log.Printf("Received display brightness command but no displays are available")
-		log.Printf("Topic: %s, Payload: %s", topic, payload)
-		log.Println("This usually means BetterDisplay CLI is not installed or not accessible")
-		return true // Return true to indicate we handled the command
+		return false // Return false so other handlers can process the command
 	}
 
 	for _, display := range app.displays {
@@ -974,6 +972,7 @@ func (app *Application) handlePlayPauseCommand(client mqtt.Client, topic, payloa
 // handleLMStudioCommand handles LM Studio control commands
 func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload string) bool {
 	basePrefix := app.getTopicPrefix()
+	log.Printf("handleLMStudioCommand called: topic=%s, payload=%s", topic, payload)
 
 	// Handle server start/stop
 	if topic == basePrefix+"/command/lmstudio_server" {
@@ -1006,6 +1005,7 @@ func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload
 	if strings.HasPrefix(topic, basePrefix+"/command/lmstudio_model_") {
 		// Extract sanitized model ID from topic
 		sanitizedID := strings.TrimPrefix(topic, basePrefix+"/command/lmstudio_model_")
+		log.Printf("Received LM Studio model command: topic=%s, payload=%s, sanitizedID=%s", topic, payload, sanitizedID)
 
 		// Find the actual model ID from our model list
 		app.lmstudioMutex.RLock()
@@ -1024,6 +1024,8 @@ func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload
 			log.Printf("Could not find model with sanitized ID: %s", sanitizedID)
 			return true
 		}
+
+		log.Printf("Found model ID: %s for sanitized ID: %s", actualModelID, sanitizedID)
 
 		// Handle load/unload based on payload
 		if payload == "load" {
@@ -1048,6 +1050,8 @@ func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload
 					app.updateLMStudioStatus(client)
 				}()
 			}
+		} else {
+			log.Printf("Unknown payload '%s' for model %s (expected 'load' or 'unload')", payload, actualModelID)
 		}
 		return true
 	}
@@ -1287,31 +1291,46 @@ func (app *Application) updateUptime(client mqtt.Client) {
 }
 
 func (app *Application) updateTemperatures(client mqtt.Client) {
+	log.Printf("updateTemperatures called")
 	temps, err := macos.GetTemperatures()
 	if err != nil {
 		log.Printf("Failed to get temperatures: %v", err)
 		return
 	}
 
-	// Publish temperature metrics
-	client.Publish(app.getTopicPrefix()+"/status/temperature/cpu", 0, false, fmt.Sprintf("%.1f", temps.CPU))
+	log.Printf("Got temperatures - CPU: %.1f°C, GPU: %.1f°C", temps.CPU, temps.GPU)
+
+	// Only publish if we have actual temperature readings (> 0)
+	if temps.CPU > 0 {
+		client.Publish(app.getTopicPrefix()+"/status/temperature/cpu", 0, false, fmt.Sprintf("%.1f", temps.CPU))
+		log.Printf("Published CPU temperature: %.1f to %s/status/temperature/cpu", temps.CPU, app.getTopicPrefix())
+	} else {
+		log.Printf("CPU temperature not available (value: %.1f), skipping publish", temps.CPU)
+	}
+
 	if temps.GPU > 0 {
 		client.Publish(app.getTopicPrefix()+"/status/temperature/gpu", 0, false, fmt.Sprintf("%.1f", temps.GPU))
+		log.Printf("Published GPU temperature: %.1f to %s/status/temperature/gpu", temps.GPU, app.getTopicPrefix())
 	}
 }
 
 func (app *Application) updateNetworkStats(client mqtt.Client) {
+	log.Printf("updateNetworkStats called")
 	now := time.Now()
 	var interval time.Duration
 	if !app.lastNetworkTime.IsZero() {
 		interval = now.Sub(app.lastNetworkTime)
 	}
+	log.Printf("Network stats interval: %v", interval)
 
 	stats, err := macos.GetNetworkStats(app.lastNetworkStats, interval)
 	if err != nil {
 		log.Printf("Failed to get network stats: %v", err)
 		return
 	}
+
+	log.Printf("Got network stats - Recv: %d bytes, Sent: %d bytes, Down: %.2f Mbps, Up: %.2f Mbps",
+		stats.BytesRecv, stats.BytesSent, stats.DownloadMbps, stats.UploadMbps)
 
 	// Update stored values
 	app.lastNetworkStats = stats
@@ -1322,6 +1341,7 @@ func (app *Application) updateNetworkStats(client mqtt.Client) {
 	client.Publish(app.getTopicPrefix()+"/status/network/bytes_sent", 0, false, fmt.Sprintf("%d", stats.BytesSent))
 	client.Publish(app.getTopicPrefix()+"/status/network/download_speed", 0, false, fmt.Sprintf("%.2f", stats.DownloadMbps))
 	client.Publish(app.getTopicPrefix()+"/status/network/upload_speed", 0, false, fmt.Sprintf("%.2f", stats.UploadMbps))
+	log.Printf("Published network stats to %s/status/network/*", app.getTopicPrefix())
 }
 
 func (app *Application) updateMediaDevices(client mqtt.Client) {

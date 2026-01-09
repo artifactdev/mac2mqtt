@@ -333,39 +333,30 @@ func getCPUTempAlternative() (float64, error) {
 }
 
 // GetGPUTemperature returns the GPU temperature in Celsius
+// Returns 0 if no dedicated GPU is found (not an error for Macs without dedicated GPU)
 func GetGPUTemperature() (float64, error) {
-	cmd := exec.Command("sudo", "powermetrics", "-n", "1", "-i", "1000", "--samplers", "smc")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, fmt.Errorf("failed to run powermetrics: %w", err)
-	}
-
-	// Parse GPU die temperature from powermetrics output
-	re := regexp.MustCompile(`GPU die temperature: ([\d.]+) C`)
-	matches := re.FindStringSubmatch(string(output))
-	if len(matches) >= 2 {
-		temp, err := strconv.ParseFloat(matches[1], 64)
-		if err == nil {
-			return temp, nil
-		}
-	}
-
-	// If no GPU temperature found, return 0 (some Macs don't have dedicated GPU)
+	// GPU temperature requires sudo powermetrics which prompts for password
+	// Skip GPU temperature monitoring to avoid password prompts
+	// Most Mac Minis use integrated graphics anyway
 	return 0, nil
 }
 
 // GetTemperatures returns CPU and GPU temperatures
 func GetTemperatures() (*TemperatureInfo, error) {
-	cpuTemp, cpuErr := GetCPUTemperature()
-	gpuTemp, _ := GetGPUTemperature() // GPU error is not critical
-
+	// Use alternative method without sudo to avoid password prompts
+	cpuTemp, cpuErr := getCPUTempAlternative()
 	if cpuErr != nil {
-		return nil, fmt.Errorf("failed to get CPU temperature: %w", cpuErr)
+		// Temperature monitoring not available on this system
+		// This is not critical, so return 0 instead of an error
+		return &TemperatureInfo{
+			CPU: 0,
+			GPU: 0,
+		}, nil
 	}
 
 	return &TemperatureInfo{
 		CPU: cpuTemp,
-		GPU: gpuTemp,
+		GPU: 0, // GPU temperature requires sudo, set to 0
 	}, nil
 }
 
