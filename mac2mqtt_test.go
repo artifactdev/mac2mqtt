@@ -1,8 +1,9 @@
 package main
 
 import (
-    "os/exec"
-    "testing"
+	"bessarabov/mac2mqtt/macos"
+	"os/exec"
+	"testing"
 )
 
 func TestMac2MQTTBinaryExists(t *testing.T) {
@@ -20,28 +21,28 @@ func TestMac2MQTTStart(t *testing.T) {
 }
 
 func TestGetHostname(t *testing.T) {
-    host := getHostname()
+    host := macos.GetHostname()
     if host == "" {
         t.Error("Hostname sollte nicht leer sein")
     }
 }
 
 func TestGetModel(t *testing.T) {
-    model := getModel()
+    model := macos.GetModel()
     if model == "" {
         t.Error("Model sollte nicht leer sein")
     }
 }
 
 func TestGetSerialnumber(t *testing.T) {
-    serial := getSerialnumber()
+    serial := macos.GetSerialnumber()
     if serial == "" {
         t.Error("Serialnumber sollte nicht leer sein")
     }
 }
 
 func TestGetWorkingDirectory(t *testing.T) {
-    wd := getWorkingDirectory()
+    wd := macos.GetWorkingDirectory()
     if wd == "" {
         t.Error("WorkingDirectory sollte nicht leer sein")
     }

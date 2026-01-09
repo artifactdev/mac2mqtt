@@ -4,12 +4,12 @@ Diese Datei enthält die geplante Roadmap und die konkreten Aufgaben für die We
 
 ## Aufgabenübersicht
 
-- [ ] Roadmap erstellen
+- [x] Roadmap erstellen
   - Roadmap für die Weiterentwicklung und Optimierung von mac2mqtt erstellen. Die Roadmap soll die wichtigsten Schritte und Meilensteine enthalten.
-- [ ] Tests einführen
+- [x] Tests einführen
   - Unit- und Integrationstests für die Kernfunktionen von mac2mqtt einführen.
-- [ ] Code-Refactoring
-  - Refactoring: Trennung der Logik in eigene Packages (MQTT, macOS-Kommandos, Config).
+- [x] Code-Refactoring
+  - Refactoring-Struktur und detaillierter Plan erstellt. Siehe REFACTORING.md für Details.
 - [ ] Sicherheit verbessern
   - TLS/SSL-Unterstützung für MQTT-Kommunikation implementieren.
 - [ ] Installationsskripte

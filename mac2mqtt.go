@@ -19,6 +19,8 @@ import (
 	"sync"
 	"time"
 
+	"bessarabov/mac2mqtt/macos"
+
 	"github.com/shirou/gopsutil/v3/mem" // Using v3 for current versions
 	"gopkg.in/yaml.v2"
 
@@ -75,45 +77,19 @@ func isMediaControlAvailable() bool {
 	return err == nil
 }
 
-// MediaInfo represents the current media playing information
-type MediaInfo struct {
-	Title       string `json:"title"`
-	Artist      string `json:"artist"`
-	Album       string `json:"album"`
-	AppName     string `json:"app_name"`
-	AppBundleID string `json:"app_bundle_id"`
-	State       string `json:"state"`    // "playing", "paused", "stopped"
-	Duration    int    `json:"duration"` // in seconds
-	Position    int    `json:"position"` // in seconds
-}
-
-// Display represents the the display information
-type Display struct {
-	UUID               string `json:"UUID"`
-	AlphanumericSerial string `json:"alphanumericSerial"`
-	DeviceType         string `json:"deviceType"`
-	DisplayID          string `json:"displayID"`
-	Model              string `json:"model"`
-	Name               string `json:"name"`
-	OriginalName       string `json:"originalName"`
-	ProductName        string `json:"productName"`
-	RegistryLocation   string `json:"registryLocation"`
-	Serial             string `json:"serial"`
-	TagID              string `json:"tagID"`
-	Vendor             string `json:"vendor"`
-	WeekOfManufacture  string `json:"weekOfManufacture"`
-	YearOfManufacture  string `json:"yearOfManufacture"`
-}
+// Type aliases for convenience
+type MediaInfo = macos.MediaInfo
+type Display = macos.Display
 
 // Application holds the main application state
 type Application struct {
 	config            *config
-	displays          []Display
+	displays          []macos.Display
 	hostname          string
 	topic             string
 	client            mqtt.Client
-	currentMediaState MediaInfo // persistent media state for streaming
-	userActivityState string    // "active" or "inactive"
+	currentMediaState macos.MediaInfo // persistent media state for streaming
+	userActivityState string           // "active" or "inactive"
 	activityMutex     sync.RWMutex
 	activityTimer     *time.Timer
 	lastCPU           sigar.Cpu // for CPU percentage calculation
@@ -165,7 +141,7 @@ func (c *config) getConfig() *config {
 	}
 
 	if c.Hostname == "" {
-		c.Hostname = getHostname()
+		c.Hostname = macos.GetHostname()
 	}
 	if c.DiscoveryPrefix == "" {
 		c.DiscoveryPrefix = "homeassistant"
@@ -183,7 +159,7 @@ func NewApplication() (*Application, error) {
 
 	// Set hostname
 	if app.config.Hostname == "" {
-		app.hostname = getHostname()
+		app.hostname = macos.GetHostname()
 	} else {
 		app.hostname = app.config.Hostname
 	}
@@ -202,18 +178,18 @@ func NewApplication() (*Application, error) {
 	}
 
 	// Initialize displays
-	app.displays = getDisplays()
+	app.displays = macos.GetDisplays()
 
 	// Initialize currentMediaState
-	if isMediaControlAvailable() {
-		mediaInfo, err := getMediaInfo()
+	if macos.IsMediaControlAvailable() {
+		mediaInfo, err := macos.GetMediaInfo()
 		if err == nil && mediaInfo != nil {
 			app.currentMediaState = *mediaInfo
 		} else {
-			app.currentMediaState = MediaInfo{State: "idle"}
+			app.currentMediaState = macos.MediaInfo{State: "idle"}
 		}
 	} else {
-		app.currentMediaState = MediaInfo{State: "idle"}
+		app.currentMediaState = macos.MediaInfo{State: "idle"}
 	}
 
 	// Initialize user activity state
@@ -246,68 +222,13 @@ func (app *Application) getTopicPrefix() string {
 	return app.topic
 }
 
-func getSerialnumber() string {
 
-	cmd := "/usr/sbin/ioreg -l | /usr/bin/grep IOPlatformSerialNumber"
-	output, err := exec.Command("/bin/sh", "-c", cmd).Output()
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	outputStr := string(output)
-	last := output[strings.LastIndex(outputStr, " ")+1:]
-	lastStr := string(last)
-	// remove all symbols, but [a-zA-Z0-9_-]
-	reg, err := regexp.Compile("[^a-zA-Z0-9_-]+")
-	if err != nil {
-		log.Fatal(err)
-	}
-	lastStr = reg.ReplaceAllString(lastStr, "")
 
-	return lastStr
-}
 
-func getModel() string {
 
-	cmd := "/usr/sbin/system_profiler SPHardwareDataType |/usr/bin/grep Chip | /usr/bin/sed 's/\\(^.*: \\)\\(.*\\)/\\2/'"
-	output, err := exec.Command("/bin/sh", "-c", cmd).Output()
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	outputStr := string(output)
-	outputStr = strings.TrimSuffix(outputStr, "\n")
-	return outputStr
-}
 
-func getHostname() string {
-
-	hostname, err := os.Hostname()
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// "name.local" => "name"
-	firstPart := strings.Split(hostname, ".")[0]
-
-	// remove all symbols, but [a-zA-Z0-9_-]
-	reg, err := regexp.Compile("[^a-zA-Z0-9_-]+")
-	if err != nil {
-		log.Fatal(err)
-	}
-	firstPart = reg.ReplaceAllString(firstPart, "")
-
-	return firstPart
-}
-
-func getWorkingDirectory() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "unknown"
-	}
-	return wd
-}
 
 func getCommandOutput(name string, arg ...string) string {
 	cmd := exec.Command(name, arg...)
@@ -467,11 +388,11 @@ func setMute(b bool) {
 }
 
 func commandSleep() {
-	runCommand("pmset", "sleepnow")
+	macos.Sleep()
 }
 
 func commandDisplaySleep() {
-	runCommand("pmset", "displaysleepnow")
+	macos.DisplaySleep()
 }
 
 func commandShutdown() {
@@ -487,7 +408,7 @@ func commandShutdown() {
 }
 
 func commandDisplayWake() {
-	runCommand("/usr/bin/caffeinate", "-u", "-t", "1")
+	macos.DisplayWake()
 }
 
 func commandKeepAwake() {
@@ -507,15 +428,15 @@ func commandAllowSleep() {
 }
 
 func commandRunShortcut(shortcut string) {
-	runCommand("shortcuts", "run", shortcut)
+	macos.RunShortcut(shortcut)
 }
 
 func commandScreensaver() {
-	runCommand("open", "-a", "ScreenSaverEngine")
+	macos.Screensaver()
 }
 
 func commandPlayPause() {
-	runCommand("media-control", "toggle-play-pause")
+	macos.PlayPause()
 }
 
 // getDisplays retrieves all available displays using BetterDisplay CLI
@@ -784,7 +705,7 @@ func (app *Application) updateNowPlaying(client mqtt.Client) {
 
 // startMediaStream starts the media-control stream for real-time updates
 func (app *Application) startMediaStream(client mqtt.Client) {
-	if !isMediaControlAvailable() {
+	if !macos.IsMediaControlAvailable() {
 		log.Println("Media Control not available - skipping media stream")
 		return
 	}
@@ -1092,13 +1013,13 @@ func (app *Application) updateDisplayBrightness(client mqtt.Client) {
 	}
 
 	// Refresh display list to handle dynamic display changes (laptop open/close)
-	currentDisplays := getDisplays()
+	currentDisplays := macos.GetDisplays()
 	if currentDisplays != nil {
 		app.displays = currentDisplays
 	}
 
 	for _, display := range app.displays {
-		brightness, err := getDisplayBrightness(display.DisplayID)
+		brightness, err := macos.GetDisplayBrightness(display.DisplayID)
 		if err != nil {
 			// Only log error once per minute to avoid spam for unavailable displays (e.g., closed laptop)
 			if display.Name == "Built-in Display" || strings.Contains(display.Name, "Built-in") {
@@ -1107,7 +1028,7 @@ func (app *Application) updateDisplayBrightness(client mqtt.Client) {
 			}
 			log.Printf("Error getting brightness for display %s: %v", display.Name, err)
 			// Check if it's a BetterDisplay CLI error
-			if !isBetterDisplayCLIAvailable() {
+			if !macos.IsBetterDisplayCLIAvailable() {
 				log.Printf("BetterDisplay CLI is not available for display %s", display.Name)
 			}
 			continue
@@ -1136,7 +1057,7 @@ func (app *Application) connectHandler(client mqtt.Client) {
 	app.sub(client, app.getTopicPrefix()+"/command/#")
 
 	// Start media stream if not already running (for reconnections)
-	if isMediaControlAvailable() {
+	if macos.IsMediaControlAvailable() {
 		go app.startMediaStream(client)
 	}
 
@@ -2143,10 +2064,10 @@ func (app *Application) setDevice(client mqtt.Client) {
 	}
 
 	device := map[string]interface{}{
-		"ids":  getSerialnumber(),
+		"ids":  macos.GetSerialnumber(),
 		"name": app.hostname,
 		"mf":   "Apple",
-		"mdl":  getModel(),
+		"mdl":  macos.GetModel(),
 	}
 
 	object := map[string]interface{}{
@@ -2176,7 +2097,7 @@ func (app *Application) handleOfflineMode() {
 // Run starts the application and runs the main loop
 func (app *Application) Run() error {
 	log.Println("=== MAC2MQTT STARTING ===")
-	log.Printf("Working directory: %s", getWorkingDirectory())
+	log.Printf("Working directory: %s", macos.GetWorkingDirectory())
 	log.Printf("Hostname set to: %s", app.hostname)
 	log.Printf("Discovery Prefix: %s", app.config.DiscoveryPrefix)
 	log.Printf("MQTT Broker: %s:%s", app.config.IP, app.config.Port)
