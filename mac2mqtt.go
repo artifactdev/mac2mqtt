@@ -987,6 +987,18 @@ func (app *Application) handleLMStudioCommand(client mqtt.Client, topic, payload
 				app.updateLMStudioStatus(client)
 			}
 		case "stop":
+			// First, unload all models before stopping the server
+			log.Println("Unloading all models before stopping LM Studio server...")
+			if err := macos.UnloadAllLMStudioModels(); err != nil {
+				log.Printf("Warning: Failed to unload all models: %v", err)
+				// Continue with server stop even if unload fails
+			} else {
+				log.Println("All models unloaded successfully")
+				// Wait a bit for models to fully unload
+				time.Sleep(2 * time.Second)
+			}
+
+			// Now stop the server
 			if err := macos.StopLMStudioServer(); err != nil {
 				log.Printf("Failed to stop LM Studio server: %v", err)
 			} else {
